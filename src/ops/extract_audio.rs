@@ -75,7 +75,9 @@ impl Operation for ExtractAudioOp {
         }
 
         // One option per audio stream so the user picks the track, not an
-        // index they have to look up.
+        // index they have to look up. A probe with no audio streams gets an
+        // explicitly disabled option — never a fake "default" that builds a
+        // doomed `-map 0:a:0` (build() refuses loudly below regardless).
         let mut tracks = match ctx.probe {
             Some(probe) => {
                 let audio: Vec<_> = probe
@@ -84,7 +86,11 @@ impl Operation for ExtractAudioOp {
                     .filter(|s| s.codec_type == Some(crate::ffmpeg::probe::StreamType::Audio))
                     .collect();
                 if audio.is_empty() {
-                    vec![SelectOption::labeled("Default audio track", "0")]
+                    vec![SelectOption::unavailable(
+                        "No audio streams in this file",
+                        "none",
+                        "the probe found no audio to extract",
+                    )]
                 } else {
                     audio
                         .iter()
@@ -165,6 +171,11 @@ impl Operation for ExtractAudioOp {
         let input = ctx
             .first_input()
             .context("extract-audio needs an input file")?;
+        if ctx.probe.is_some_and(|p| !p.has_audio()) {
+            return Err(anyhow::anyhow!(
+                "this file has no audio streams to extract — pick a file with audio, or another operation"
+            ));
+        }
         let program = ctx
             .caps
             .and_then(|c| c.ffmpeg_path.clone())

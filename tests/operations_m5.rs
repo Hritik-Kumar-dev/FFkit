@@ -529,3 +529,56 @@ fn compress_even_dimensions_gain_no_filter() {
         spec.args
     );
 }
+
+/// §5: a video-only input refuses loudly at build time instead of emitting
+/// a doomed `-map 0:a:0` that ffmpeg rejects cryptically at runtime.
+#[test]
+fn extract_audio_refuses_video_only_input() {
+    use ffkit::ffmpeg::probe::{ProbeResult, StreamInfo, StreamType};
+
+    let op = operation_for("extract-audio").expect("op exists");
+    let probe = ProbeResult {
+        path: PathBuf::from("silent.mp4"),
+        duration: None,
+        size_bytes: None,
+        format_name: Some("mp4".to_string()),
+        bit_rate_bps: None,
+        streams: vec![StreamInfo {
+            codec_type: Some(StreamType::Video),
+            codec_name: Some("h264".to_string()),
+            width: Some(320),
+            height: Some(240),
+            ..StreamInfo::default()
+        }],
+    };
+    let owned = OwnedCtx::new(
+        &["silent.mp4"],
+        Some("silent_audio.mp3"),
+        &[
+            ("format", text("mp3")),
+            ("track", text("0")),
+            ("bitrate", text("192k")),
+        ],
+    )
+    .with_probes(vec![probe.clone()]);
+    let err = op.build(&owned.view()).expect_err("must refuse loudly");
+    assert!(err.to_string().contains("no audio streams"), "{err}");
+
+    // The form offers no fake default track either.
+    let fields = op.fields(&ffkit::ops::fields::FieldContext {
+        probe: Some(&probe),
+        caps: None,
+    });
+    let track = fields
+        .iter()
+        .find(|f| f.id == "track")
+        .expect("track field");
+    let selected = match track.value() {
+        ffkit::ops::fields::FieldValue::Text(value) => value,
+        other => panic!("track must be a select, got {other:?}"),
+    };
+    assert_ne!(
+        selected, "0",
+        "no selectable default track without audio (got a fake default)"
+    );
+}
