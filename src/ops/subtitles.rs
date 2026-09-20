@@ -1,0 +1,228 @@
+//! Subtitles: burn in or mux as a soft track (M5).
+//!
+//! Burning (`-vf subtitles=…`) bakes the text into pixels and forces a
+//! re-encode; embedding (`-c:s`) muxes the track untouched with full stream
+//! copy. The preview makes the cost difference unmistakable.
+
+use anyhow::{Context, Result};
+use tui_input::Input;
+
+use crate::ffmpeg::builder::{
+    default_output_name, input_extension, push_globals, safe_path_arg, CommandSpec,
+};
+use crate::ops::fields::{
+    default_selected, gate_by_capability, BuildContext, Field, FieldContext, FieldKind,
+    SelectOption,
+};
+use crate::ops::{simple_op, InputKind, Operation};
+
+simple_op!(
+    SubtitlesOp,
+    "subtitles",
+    "Subtitles",
+    "Burn subtitles in or mux them as a soft track",
+    InputKind::Video
+);
+
+/// Toggle index for burning in (vs soft-muxing).
+const MODE_BURN: usize = 0;
+
+/// Escape a path for the `subtitles` filter value: backslash, quote, colon,
+/// and comma are all significant to the filtergraph parser.
+fn escape_subtitles_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(c, '\\' | '\'' | ':' | ',') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl Operation for SubtitlesOp {
+    fn id(&self) -> &'static str {
+        "subtitles"
+    }
+
+    fn name(&self) -> &'static str {
+        "Subtitles"
+    }
+
+    fn description(&self) -> &'static str {
+        "Burn subtitles in or mux them as a soft track"
+    }
+
+    fn accepts(&self) -> InputKind {
+        InputKind::Video
+    }
+
+    fn fields(&self, ctx: &FieldContext) -> Vec<Field> {
+        let caps_known = ctx.caps.is_some();
+        let has_encoder = |name: &str| ctx.caps.is_some_and(|c| c.has_encoder(name));
+        let mut video_codecs = vec![
+            SelectOption::labeled("H.264 (libx264)", "libx264"),
+            SelectOption::labeled("H.265 (libx265)", "libx265"),
+        ];
+        gate_by_capability(
+            &mut video_codecs,
+            "libx264",
+            has_encoder("libx264"),
+            caps_known,
+        );
+        gate_by_capability(
+            &mut video_codecs,
+            "libx265",
+            has_encoder("libx265"),
+            caps_known,
+        );
+
+        let input = ctx
+            .probe
+            .map(|p| p.path.clone())
+            .unwrap_or_else(|| "input.mp4".into());
+        let ext = input_extension(&input);
+        let ext = if ext.is_empty() {
+            "mp4".to_string()
+        } else {
+            ext
+        };
+
+        vec![
+            Field {
+                id: "subs",
+                label: "Subtitle file".into(),
+                kind: FieldKind::Text {
+                    value: Input::new(String::new()),
+                },
+                explanation: "Path to the .srt/.ass/.vtt file. (A file-picker for sidecars lands with presets in M6 — type the path for now.)".into(),
+            },
+            Field {
+                id: "mode",
+                label: "Mode".into(),
+                kind: FieldKind::Toggle {
+                    options: ["Burn into video".to_string(), "Embed soft track".to_string()],
+                    selected: MODE_BURN,
+                },
+                explanation: "Burn bakes text into pixels (works everywhere, forces a re-encode). Embed keeps a toggleable track with full stream copy (fast, needs player support).".into(),
+            },
+            Field {
+                id: "video_codec",
+                label: "Video codec".into(),
+                kind: FieldKind::Select {
+                    selected: default_selected(&video_codecs),
+                    options: video_codecs,
+                },
+                explanation: "Encoder for Burn mode. Ignored when embedding — nothing is re-encoded.".into(),
+            },
+            Field {
+                id: "crf",
+                label: "Quality (CRF)".into(),
+                kind: FieldKind::Slider {
+                    min: 0,
+                    max: 51,
+                    value: 23,
+                    step: 1,
+                    landmarks: vec![
+                        (18, "visually lossless".into()),
+                        (23, "x264 default".into()),
+                        (28, "noticeably lossy".into()),
+                    ],
+                    caption: Some("smaller file ◂──▸ better quality".into()),
+                },
+                explanation: "Quality for the Burn re-encode. Ignored when embedding.".into(),
+            },
+            Field {
+                id: "output",
+                label: "Output".into(),
+                kind: FieldKind::Text {
+                    value: Input::new(
+                        default_output_name(&input, "subtitled", &ext)
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                },
+                explanation: "Output path.".into(),
+            },
+        ]
+    }
+
+    fn build(&self, ctx: &BuildContext) -> Result<CommandSpec> {
+        let input = ctx.first_input().context("subtitles needs an input file")?;
+        let program = ctx
+            .caps
+            .and_then(|c| c.ffmpeg_path.clone())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ffmpeg".to_string());
+
+        let subs = ctx.get_str("subs", "").trim().to_string();
+        if subs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "a subtitle file path is required — type one into Subtitle file"
+            ));
+        }
+        let burn = ctx.get_toggle("mode", MODE_BURN) == MODE_BURN;
+
+        let mut spec = CommandSpec::new(program);
+        push_globals(&mut spec, true);
+        spec.arg("-i");
+        spec.arg(safe_path_arg(input));
+
+        if burn {
+            let vcodec = ctx.get_str("video_codec", "libx264");
+            spec.flag_value(
+                "-vf",
+                format!("subtitles={}", escape_subtitles_path(&subs)),
+                "Render the subtitles into the pixels. Baking text in forces a full video re-encode.",
+            );
+            spec.flag_value("-c:v", vcodec.clone(), format!("Re-encode with {vcodec}."));
+            spec.flag_value(
+                "-crf",
+                ctx.get_int("crf", 23).to_string(),
+                "Quality for the burned-in re-encode.",
+            );
+            spec.flag_value("-c:a", "copy", "Audio is untouched — copied.");
+        } else {
+            spec.arg("-i");
+            spec.arg(safe_path_arg(std::path::Path::new(&subs)));
+            spec.flag_value("-map", "0", "Keep every stream from the video.");
+            spec.flag_value("-map", "1", "Add the subtitle file as a new stream.");
+            // Blanket copy, then the subtitle codec for the container.
+            spec.flag_value(
+                "-c",
+                "copy",
+                "Stream-copy everything: embedding touches no media bits.",
+            );
+            spec.flag_value(
+                "-c:s",
+                "mov_text",
+                "Subtitle codec for MP4/MOV (use srt for MKV — container pick lands in M6).",
+            );
+        }
+
+        let output = match ctx.output {
+            Some(path) => path.clone(),
+            None => {
+                let ext = input_extension(input);
+                let ext = if ext.is_empty() { "mp4" } else { &ext };
+                default_output_name(input, "subtitled", ext)
+            }
+        };
+        spec.arg(safe_path_arg(&output));
+        Ok(spec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_subtitles_path;
+
+    #[test]
+    fn subtitles_path_escaping_covers_filtergraph_metachars() {
+        assert_eq!(
+            escape_subtitles_path("/v/my subs, part 1:final.srt"),
+            "/v/my subs\\, part 1\\:final.srt"
+        );
+        assert_eq!(escape_subtitles_path("it's.srt"), "it\\'s.srt");
+    }
+}
