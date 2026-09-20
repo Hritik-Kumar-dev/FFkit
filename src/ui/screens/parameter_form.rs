@@ -52,6 +52,12 @@ pub struct ParamForm {
     pub changed: Option<(String, Instant)>,
     /// Tab focus: false = parameters, true = command pane (scroll with ↑↓).
     pub focus_cmd: bool,
+    /// Join order for concat with several inputs; `None` for every other
+    /// operation. Rendered as a numbered list above the fields (§11).
+    pub inputs_order: Option<Vec<PathBuf>>,
+    /// Cursor into `inputs_order` when the Tab cycle has parked focus on
+    /// the order list (`None` = fields or command focused).
+    pub inputs_focus: Option<usize>,
     /// Scroll offset into the wrapped command lines.
     pub cmd_scroll: usize,
     /// A text field is being edited (global single-key bindings suspended).
@@ -79,6 +85,8 @@ impl ParamForm {
             build_error: None,
             changed: None,
             focus_cmd: false,
+            inputs_order: None,
+            inputs_focus: None,
             cmd_scroll: 0,
             editing: false,
             edit_select_all: false,
@@ -140,6 +148,9 @@ impl ParamForm {
         if self.editing {
             return self.on_key_editing(key);
         }
+        if self.inputs_focus.is_some() {
+            return self.on_key_order(key);
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.focus_cmd {
@@ -171,10 +182,10 @@ impl ParamForm {
                 }
             }
             KeyCode::Tab => {
-                self.focus_cmd = !self.focus_cmd;
+                self.cycle_pane(true);
             }
             KeyCode::BackTab => {
-                self.focus_cmd = !self.focus_cmd;
+                self.cycle_pane(false);
             }
             KeyCode::Enter => {
                 if let Some(field) = self.fields.get(self.focus) {
@@ -217,6 +228,86 @@ impl ParamForm {
     /// Currently focused field, if any.
     pub fn focused(&self) -> Option<&Field> {
         self.fields.get(self.focus)
+    }
+
+    /// Tab cycle across panes: fields → order list (concat only) →
+    /// command → fields. Reverse on Shift+Tab.
+    fn cycle_pane(&mut self, forward: bool) {
+        let has_order = self.inputs_order.is_some();
+        if forward {
+            if !self.focus_cmd && self.inputs_focus.is_none() {
+                if has_order {
+                    self.inputs_focus = Some(0);
+                } else {
+                    self.focus_cmd = true;
+                }
+            } else if self.inputs_focus.is_some() {
+                self.inputs_focus = None;
+                self.focus_cmd = true;
+            } else {
+                self.inputs_focus = None;
+                self.focus_cmd = false;
+            }
+        } else if !self.focus_cmd && self.inputs_focus.is_none() {
+            self.focus_cmd = true;
+        } else if self.focus_cmd {
+            self.focus_cmd = false;
+            if has_order {
+                let len = self.inputs_order.as_ref().map(Vec::len).unwrap_or(0);
+                self.inputs_focus = Some(len.saturating_sub(1));
+            }
+        } else {
+            self.inputs_focus = None;
+            self.focus_cmd = false;
+        }
+    }
+
+    /// Keys parked on the join-order list (§11): cursor motion, J/K
+    /// reordering (rebuilds the preview — order is the command), Tab
+    /// onward, Enter to run, Esc back.
+    fn on_key_order(&mut self, key: KeyEvent) -> FormAction {
+        let len = self.inputs_order.as_ref().map(Vec::len).unwrap_or(0);
+        if len == 0 {
+            self.inputs_focus = None;
+            return FormAction::None;
+        }
+        let focus = self.inputs_focus.unwrap_or(0).min(len - 1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.inputs_focus = Some(focus.saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.inputs_focus = Some((focus + 1).min(len - 1));
+            }
+            KeyCode::Char('J') => {
+                if focus + 1 < len {
+                    if let Some(order) = self.inputs_order.as_mut() {
+                        order.swap(focus, focus + 1);
+                    }
+                    self.inputs_focus = Some(focus + 1);
+                    return FormAction::Changed;
+                }
+            }
+            KeyCode::Char('K') => {
+                if focus > 0 {
+                    if let Some(order) = self.inputs_order.as_mut() {
+                        order.swap(focus, focus - 1);
+                    }
+                    self.inputs_focus = Some(focus - 1);
+                    return FormAction::Changed;
+                }
+            }
+            KeyCode::Tab => {
+                self.cycle_pane(true);
+            }
+            KeyCode::BackTab => {
+                self.cycle_pane(false);
+            }
+            KeyCode::Enter => return FormAction::Run,
+            KeyCode::Esc => return FormAction::Back,
+            _ => {}
+        }
+        FormAction::None
     }
 }
 
@@ -331,8 +422,12 @@ pub fn render(frame: &mut Frame, app: &crate::app::App, form: &ParamForm, theme:
 
     let hints = if form.editing {
         "typing… Enter done · Esc cancel editing"
+    } else if form.inputs_focus.is_some() {
+        "↑↓ cursor · J/K reorder · Enter run · Tab panes · Esc back"
     } else if form.focus_cmd {
         "↑↓ scroll command · Tab back to fields · c copy · Esc back"
+    } else if form.inputs_order.is_some() {
+        "↑↓ field · ←→ adjust · Enter edit/run · Tab order+command · c copy · s preset · ? help · esc back"
     } else {
         "↑↓ field · ←→ adjust · Enter edit/run · Tab command · c copy · s preset · ? help · esc back"
     };
@@ -348,9 +443,40 @@ pub fn render(frame: &mut Frame, app: &crate::app::App, form: &ParamForm, theme:
     }
 }
 
-/// Render the parameter rows with focus highlight.
+/// Render the parameter rows with focus highlight, plus the join-order
+/// list on top for concat (§11).
 fn render_fields(frame: &mut Frame, area: Rect, form: &ParamForm, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
+    if let Some(order) = form.inputs_order.as_ref() {
+        let list_focused = form.inputs_focus.is_some();
+        lines.push(Line::from(Span::styled(
+            "Join order (Tab focuses, J/K reorders):",
+            if list_focused {
+                theme.title()
+            } else {
+                theme.muted_style()
+            },
+        )));
+        for (i, input) in order.iter().enumerate() {
+            let cursor = list_focused && form.inputs_focus == Some(i);
+            let name = input
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| input.display().to_string());
+            lines.push(Line::from(vec![
+                Span::raw(if cursor { "▸ " } else { "  " }),
+                Span::styled(
+                    format!("{}. {name}", i + 1),
+                    if cursor {
+                        theme.selected()
+                    } else {
+                        theme.muted_style()
+                    },
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
     if form.fields.is_empty() {
         lines.push(Line::from(Span::styled(
             "No parameters yet — this operation lands in M5.",
@@ -358,7 +484,7 @@ fn render_fields(frame: &mut Frame, area: Rect, form: &ParamForm, theme: &Theme)
         )));
     }
     for (i, field) in form.fields.iter().enumerate() {
-        let focused = i == form.focus && !form.focus_cmd;
+        let focused = i == form.focus && !form.focus_cmd && form.inputs_focus.is_none();
         let select_all = focused && form.editing && form.edit_select_all;
         lines.extend(field_lines(field, focused, select_all, theme));
     }
@@ -564,9 +690,15 @@ fn render_command(frame: &mut Frame, area: Rect, form: &ParamForm, theme: &Theme
         .as_ref()
         .filter(|(_, at)| at.elapsed().as_millis() < HIGHLIGHT_MS)
         .map(|(token, _)| token.as_str());
-    let explanation = form
-        .focused()
-        .map(|field| (field.label.as_str(), field.explanation.as_str()));
+    let explanation = if form.inputs_focus.is_some() {
+        Some((
+            "Join order",
+            "Concatenation follows this list top to bottom. J/K moves the cursor entry; the preview rebuilds on every move.",
+        ))
+    } else {
+        form.focused()
+            .map(|field| (field.label.as_str(), field.explanation.as_str()))
+    };
     render_spec_preview(
         frame,
         area,
@@ -696,8 +828,14 @@ fn edit_cursor(form: &ParamForm, area: Rect) -> Option<(u16, u16)> {
         return None;
     };
     // Rows before the focused one take exactly one line each (captions only
-    // render under the focused slider, i.e. at/after this row).
-    let row = form.focus;
+    // render under the focused slider, i.e. at/after this row), plus the
+    // join-order block when present (header + items + blank line).
+    let order_rows = form
+        .inputs_order
+        .as_ref()
+        .map(|order| order.len() + 2)
+        .unwrap_or(0);
+    let row = order_rows + form.focus;
     let text = value.value();
     let cursor = (value.visual_cursor() as u16).min(text.len().min(40) as u16);
     // "[text]" starts after "▸ label  " — marker(2) + label + 2 spaces + '['.
@@ -737,6 +875,8 @@ mod tests {
             build_error: None,
             changed: None,
             focus_cmd: false,
+            inputs_order: None,
+            inputs_focus: None,
             cmd_scroll: 0,
             editing: false,
             edit_select_all: false,
@@ -805,5 +945,69 @@ mod tests {
         let old = vec!["-y".to_string()];
         let new = vec!["-y".to_string(), "-vf".to_string()];
         assert_eq!(diff_token(&old, &new), Some("-vf".to_string()));
+    }
+
+    fn order_form() -> ParamForm {
+        let mut form = output_form();
+        form.inputs_order = Some(vec![
+            std::path::PathBuf::from("a.mp4"),
+            std::path::PathBuf::from("b.mp4"),
+            std::path::PathBuf::from("c.mp4"),
+        ]);
+        form
+    }
+
+    #[test]
+    fn tab_cycles_fields_order_command() {
+        let mut form = order_form();
+        form.on_key(key(KeyCode::Tab));
+        assert_eq!(form.inputs_focus, Some(0));
+        form.on_key(key(KeyCode::Tab));
+        assert!(form.focus_cmd);
+        form.on_key(key(KeyCode::Tab));
+        assert_eq!(form.inputs_focus, None);
+        assert!(!form.focus_cmd);
+    }
+
+    #[test]
+    fn tab_skips_order_when_absent() {
+        let mut form = output_form();
+        form.on_key(key(KeyCode::Tab));
+        assert!(form.focus_cmd);
+        assert_eq!(form.inputs_focus, None);
+    }
+
+    #[test]
+    fn j_k_move_items_and_report_changed() {
+        let mut form = order_form();
+        form.inputs_focus = Some(0);
+        assert_eq!(form.on_key(key(KeyCode::Char('J'))), FormAction::Changed);
+        assert_eq!(form.inputs_focus, Some(1));
+        let names: Vec<String> = form
+            .inputs_order
+            .as_ref()
+            .expect("order")
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["b.mp4", "a.mp4", "c.mp4"]);
+        assert_eq!(form.on_key(key(KeyCode::Char('K'))), FormAction::Changed);
+        let names: Vec<String> = form
+            .inputs_order
+            .as_ref()
+            .expect("order")
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.mp4", "b.mp4", "c.mp4"]);
+    }
+
+    #[test]
+    fn reorder_at_edges_is_a_noop() {
+        let mut form = order_form();
+        form.inputs_focus = Some(0);
+        assert_eq!(form.on_key(key(KeyCode::Char('K'))), FormAction::None);
+        form.inputs_focus = Some(2);
+        assert_eq!(form.on_key(key(KeyCode::Char('J'))), FormAction::None);
     }
 }

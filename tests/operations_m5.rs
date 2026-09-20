@@ -408,6 +408,11 @@ fn concat_demuxer_for_matching_inputs() {
     assert!(spec.args.contains(&"copy".to_string()));
     let list = spec.concat_list.expect("demuxer needs a list file");
     assert_eq!(list.inputs.len(), 2);
+    // Join order follows input order (the form's J/K reorder flows here).
+    assert_eq!(
+        list.inputs,
+        vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")]
+    );
     assert!(
         spec.explanation.iter().any(|e| e.flag == "-c copy"),
         "method choice must be explained"

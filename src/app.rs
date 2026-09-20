@@ -468,6 +468,14 @@ impl App {
                 }
                 self.form_inputs = inputs;
                 self.open_form_or_trim();
+                // Concat with several inputs gets the reorderable join
+                // order (§11); the preview rebuilds from it.
+                if self.selected_operation_meta().id == "concat" && self.form_inputs.len() > 1 {
+                    if let Some(form) = self.form.as_mut() {
+                        form.inputs_order = Some(self.form_inputs.clone());
+                    }
+                    self.rebuild_form();
+                }
                 self.status_message = None;
             }
         }
@@ -783,7 +791,18 @@ impl App {
         };
         match action {
             parameter_form::FormAction::None => {}
-            parameter_form::FormAction::Changed => self.rebuild_form(),
+            parameter_form::FormAction::Changed => {
+                // A join-order move renames the inputs themselves: sync
+                // back so the build, media panel, and probes follow it.
+                if let Some(order) = self
+                    .form
+                    .as_ref()
+                    .and_then(|form| form.inputs_order.clone())
+                {
+                    self.form_inputs = order;
+                }
+                self.rebuild_form();
+            }
             parameter_form::FormAction::Back => {
                 self.screen = Screen::FileBrowser;
                 self.status_message = None;
