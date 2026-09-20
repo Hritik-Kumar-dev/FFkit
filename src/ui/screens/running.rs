@@ -412,12 +412,20 @@ fn render_progress_block(
         format!("elapsed {elapsed}"),
         theme.muted_style(),
     ));
-    if let Some(eta) = state.eta() {
-        stats.push(Span::raw(" · "));
-        stats.push(Span::styled(
-            format!("ETA {}", format_duration(Duration::from_secs_f64(eta))),
+    // The countdown always renders: ticking down when the estimate exists,
+    // an explicit `--:--` while duration or speed is still unknown — never
+    // absent (an absent field reads as "only elapsed exists") and never a
+    // fake number before the data stabilizes (§12).
+    stats.push(Span::raw(" · "));
+    match state.eta() {
+        Some(eta) => stats.push(Span::styled(
+            format!(
+                "remaining {}",
+                format_duration(Duration::from_secs_f64(eta))
+            ),
             theme.title(),
-        ));
+        )),
+        None => stats.push(Span::styled("remaining --:--", theme.footer())),
     }
     if let Some(speed) = state.last_speed {
         stats.push(Span::raw(" · "));
@@ -596,5 +604,79 @@ mod tests {
         state.phase = RunPhase::ConfirmDelete;
         on_key(&mut state, key(KeyCode::Enter));
         assert_eq!(state.phase, RunPhase::Done);
+    }
+
+    /// §12: the countdown renders ticking down next to elapsed…
+    #[test]
+    fn remaining_counts_down_alongside_elapsed() {
+        use crate::ffmpeg::progress::ProgressUpdate;
+        use std::collections::HashMap;
+
+        let channel = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(channel.0, channel.1, Default::default());
+        let spec = crate::ffmpeg::builder::CommandSpec::new("ffmpeg");
+        let mut run = RunState::starting(
+            "Convert".into(),
+            &spec,
+            PathBuf::from("out.mp4"),
+            Some(Duration::from_secs(80)),
+            None,
+        );
+        run.apply_progress(&ProgressUpdate {
+            out_time: Some(Duration::from_secs(20)),
+            speed: Some(2.0),
+            frame: None,
+            fps: None,
+            bitrate_kbps: None,
+            total_size_bytes: None,
+            dup_frames: None,
+            drop_frames: None,
+            stream_q: HashMap::new(),
+            finished: false,
+        });
+        app.run = Some(run);
+        app.screen = crate::app::Screen::Running;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("elapsed"), "{content}");
+        // (80 - 20) / 2 = 30s remaining.
+        assert!(content.contains("remaining 0:30"), "{content}");
+    }
+
+    /// §12: …and shows an explicit indeterminate marker before the data
+    /// exists instead of omitting the field.
+    #[test]
+    fn remaining_is_indeterminate_without_data() {
+        let channel = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(channel.0, channel.1, Default::default());
+        let spec = crate::ffmpeg::builder::CommandSpec::new("ffmpeg");
+        let run = RunState::starting(
+            "Convert".into(),
+            &spec,
+            PathBuf::from("out.mp4"),
+            None,
+            None,
+        );
+        app.run = Some(run);
+        app.screen = crate::app::Screen::Running;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("remaining --:--"), "{content}");
     }
 }
