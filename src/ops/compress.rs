@@ -11,7 +11,8 @@ use anyhow::{Context, Result};
 use tui_input::Input;
 
 use crate::ffmpeg::builder::{
-    default_output_name, input_extension, push_globals, safe_path_arg, CommandSpec,
+    default_output_name, even_dims_filter, input_extension, push_globals, resolve_output,
+    safe_path_arg, CommandSpec,
 };
 use crate::ops::fields::{
     default_selected, gate_by_capability, BuildContext, Field, FieldContext, FieldKind,
@@ -268,6 +269,21 @@ impl Operation for CompressOp {
                     format!("scale={scale}"),
                     "Downscale the video, preserving aspect ratio with even dimensions.",
                 );
+            } else if let Some(even) = even_dims_filter(ctx.probe) {
+                // Odd-sized sources (phone video, screencasts) would make
+                // x264/x265 refuse the encode — shave the odd edge instead.
+                let dims = ctx
+                    .probe
+                    .and_then(|p| p.video_stream())
+                    .map(|v| format!("{}x{}", v.width.unwrap_or(0), v.height.unwrap_or(0)))
+                    .unwrap_or_else(|| "odd-sized".to_string());
+                spec.flag_value(
+                    "-vf",
+                    format!("scale={even}"),
+                    format!(
+                        "Source is {dims}, which these encoders refuse — shave one pixel edge to even dimensions."
+                    ),
+                );
             }
         }
 
@@ -293,14 +309,9 @@ impl Operation for CompressOp {
             }
         }
 
-        let output = match ctx.output {
-            Some(path) => path.clone(),
-            None => {
-                let ext = input_extension(input);
-                let ext = if ext.is_empty() { "mp4" } else { &ext };
-                default_output_name(input, "compressed", ext)
-            }
-        };
+        let ext = input_extension(input);
+        let ext = if ext.is_empty() { "mp4" } else { &ext };
+        let output = resolve_output(ctx.output, default_output_name(input, "compressed", ext));
         spec.arg(safe_path_arg(&output));
         Ok(spec)
     }

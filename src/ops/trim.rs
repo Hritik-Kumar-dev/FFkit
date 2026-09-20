@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 use tui_input::Input;
 
 use crate::ffmpeg::builder::{
-    default_output_name, input_extension, push_globals, safe_path_arg, CommandSpec,
+    default_output_name, even_dims_filter, input_extension, push_globals, resolve_output,
+    safe_path_arg, CommandSpec,
 };
 use crate::ops::fields::{
     default_selected, gate_by_capability, BuildContext, Field, FieldContext, FieldKind,
@@ -216,6 +217,13 @@ impl Operation for TrimOp {
                 );
             }
             let vcodec = ctx.get_str("video_codec", "libx264");
+            if let Some(even) = even_dims_filter(ctx.probe) {
+                spec.flag_value(
+                    "-vf",
+                    format!("scale={even}"),
+                    "Odd-sized source, which these encoders refuse — shave one pixel edge to even dimensions.",
+                );
+            }
             spec.flag_value(
                 "-c:v",
                 vcodec.clone(),
@@ -229,14 +237,9 @@ impl Operation for TrimOp {
             spec.flag_value("-c:a", "aac", "Re-encode the audio to stay in sync.");
         }
 
-        let output = match ctx.output {
-            Some(path) => path.clone(),
-            None => {
-                let ext = input_extension(input);
-                let ext = if ext.is_empty() { "mp4" } else { &ext };
-                default_output_name(input, "trimmed", ext)
-            }
-        };
+        let ext = input_extension(input);
+        let ext = if ext.is_empty() { "mp4" } else { &ext };
+        let output = resolve_output(ctx.output, default_output_name(input, "trimmed", ext));
         spec.arg(safe_path_arg(&output));
         Ok(spec)
     }

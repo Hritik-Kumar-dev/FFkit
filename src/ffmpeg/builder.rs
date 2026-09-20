@@ -235,6 +235,28 @@ pub fn default_output_name(input: &Path, suffix: &str, ext: &str) -> PathBuf {
     }
 }
 
+/// Resolve the effective output path from a user-typed override and the
+/// builder's default (§3 of the fix pass):
+/// - missing or empty override → the default naming pattern;
+/// - override without an extension → the default's extension is appended,
+///   so a `.mp4`-encoded file is never accidentally written extensionless;
+/// - override with an extension → used literally.
+pub fn resolve_output(output: Option<&PathBuf>, default: PathBuf) -> PathBuf {
+    let Some(path) = output else {
+        return default;
+    };
+    if path.as_os_str().is_empty() {
+        return default;
+    }
+    if path.extension().is_some_and(|ext| !ext.is_empty()) {
+        return path.clone();
+    }
+    match default.extension() {
+        Some(ext) => path.with_extension(ext),
+        None => path.clone(),
+    }
+}
+
 /// Container extension of `path`, lowercased, without the dot.
 /// Empty when the input has no extension.
 pub fn input_extension(input: &Path) -> String {
@@ -242,6 +264,22 @@ pub fn input_extension(input: &Path) -> String {
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default()
+}
+
+/// Even-dimension guard for block encoders (x264/x265 refuse odd widths or
+/// heights). When the probe reports odd dimensions and no user scale
+/// applies, returns a shave-the-odd-edge filter (`trunc(iw/2)*2:...`);
+/// `None` when dimensions are even or unknown. Callers emit it as `-vf`
+/// with an explanation naming the source size — visible in the preview,
+/// never silent, and only ever added when the alternative is certain
+/// encoder failure.
+pub fn even_dims_filter(probe: Option<&crate::ffmpeg::probe::ProbeResult>) -> Option<String> {
+    let video = probe?.video_stream()?;
+    let (width, height) = (video.width?, video.height?);
+    if width % 2 == 0 && height % 2 == 0 {
+        return None;
+    }
+    Some("trunc(iw/2)*2:trunc(ih/2)*2".to_string())
 }
 
 #[cfg(test)]
@@ -279,6 +317,27 @@ mod tests {
         assert_eq!(
             default_output_name(Path::new("clip.mkv"), "trimmed", "mp4"),
             PathBuf::from("clip_trimmed.mp4")
+        );
+    }
+
+    #[test]
+    fn resolve_output_completes_missing_parts() {
+        let default = PathBuf::from("/v/holiday_compressed.mp4");
+        // Missing or empty → default pattern.
+        assert_eq!(resolve_output(None, default.clone()), default);
+        assert_eq!(
+            resolve_output(Some(&PathBuf::from("")), default.clone()),
+            default
+        );
+        // With extension → literal.
+        assert_eq!(
+            resolve_output(Some(&PathBuf::from("my.mkv")), default.clone()),
+            PathBuf::from("my.mkv")
+        );
+        // No extension → default's extension appended, never extensionless.
+        assert_eq!(
+            resolve_output(Some(&PathBuf::from("/v/final")), default.clone()),
+            PathBuf::from("/v/final.mp4")
         );
     }
 

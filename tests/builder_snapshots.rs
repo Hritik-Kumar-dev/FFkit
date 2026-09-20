@@ -319,3 +319,23 @@ fn all_eleven_operations_are_implemented() {
         );
     }
 }
+
+/// §3: a typed output without an extension gains the format's extension —
+/// never an extensionless `.mp4`-encoded file.
+#[test]
+fn output_without_extension_gains_format_ext() {
+    let op = operation_for("convert").expect("convert exists");
+    let owned = OwnedCtx::new(
+        &["film.mkv"],
+        Some("myclip"),
+        &[
+            ("format", text("mp4")),
+            ("video_codec", text("libx264")),
+            ("audio_codec", text("aac")),
+            ("crf", FieldValue::Int(23)),
+            ("faststart", FieldValue::Toggle(0)),
+        ],
+    );
+    let spec = op.build(&owned.view()).expect("build succeeds");
+    assert_eq!(spec.args.last().map(String::as_str), Some("myclip.mp4"));
+}

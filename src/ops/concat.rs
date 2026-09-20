@@ -12,7 +12,9 @@
 use anyhow::Result;
 use tui_input::Input;
 
-use crate::ffmpeg::builder::{push_globals, safe_path_arg, CommandSpec, ConcatListFile};
+use crate::ffmpeg::builder::{
+    push_globals, resolve_output, safe_path_arg, CommandSpec, ConcatListFile,
+};
 use crate::ops::fields::{BuildContext, Field, FieldContext, FieldKind, SelectOption};
 use crate::ops::{simple_op, InputKind, Operation};
 
@@ -114,10 +116,7 @@ impl Operation for ConcatOp {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "ffmpeg".to_string());
 
-        let output = match ctx.output {
-            Some(path) => path.clone(),
-            None => std::path::PathBuf::from("joined.mp4"),
-        };
+        let output = resolve_output(ctx.output, std::path::PathBuf::from("joined.mp4"));
 
         let method = ctx.get_str("method", "auto");
         let demuxer = match method.as_str() {

@@ -3,7 +3,9 @@
 use anyhow::{Context, Result};
 use tui_input::Input;
 
-use crate::ffmpeg::builder::{default_output_name, push_globals, safe_path_arg, CommandSpec};
+use crate::ffmpeg::builder::{
+    default_output_name, even_dims_filter, push_globals, resolve_output, safe_path_arg, CommandSpec,
+};
 use crate::ops::fields::{
     default_selected, gate_by_capability, BuildContext, Field, FieldContext, FieldKind,
     SelectOption,
@@ -180,6 +182,13 @@ impl Operation for ConvertOp {
                     ctx.get_int("crf", 23).to_string(),
                     "Quality level for the re-encoded video.",
                 );
+                if let Some(even) = even_dims_filter(ctx.probe) {
+                    spec.flag_value(
+                        "-vf",
+                        format!("scale={even}"),
+                        "Odd-sized source, which these encoders refuse — shave one pixel edge to even dimensions.",
+                    );
+                }
             }
         }
         match ctx.get_str("audio_codec", "aac").as_str() {
@@ -198,10 +207,7 @@ impl Operation for ConvertOp {
             );
         }
 
-        let output = match ctx.output {
-            Some(path) => path.clone(),
-            None => default_output_name(input, "converted", &format),
-        };
+        let output = resolve_output(ctx.output, default_output_name(input, "converted", &format));
         spec.arg(safe_path_arg(&output));
         Ok(spec)
     }

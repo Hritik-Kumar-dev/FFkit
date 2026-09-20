@@ -8,7 +8,9 @@
 use anyhow::{Context, Result};
 use tui_input::Input;
 
-use crate::ffmpeg::builder::{default_output_name, push_globals, safe_path_arg, CommandSpec};
+use crate::ffmpeg::builder::{
+    default_output_name, push_globals, resolve_output, safe_path_arg, CommandSpec,
+};
 use crate::ops::fields::{BuildContext, Field, FieldContext, FieldKind, SelectOption};
 use crate::ops::{simple_op, InputKind, Operation};
 
@@ -126,10 +128,7 @@ impl Operation for GifOp {
             "-1"
         };
 
-        let output = match ctx.output {
-            Some(path) => path.clone(),
-            None => default_output_name(input, "anim", "gif"),
-        };
+        let output = resolve_output(ctx.output, default_output_name(input, "anim", "gif"));
         // Kept next to the output so the preview names a real file.
         let palette_name = format!(
             "{}_palette.png",

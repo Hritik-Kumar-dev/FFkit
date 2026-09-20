@@ -92,6 +92,10 @@ pub struct RunState {
     pub cancel_tx: Option<oneshot::Sender<()>>,
     /// Final result, once finished.
     pub result: Option<JobResult>,
+    /// When a successful job settled — drives the §2 auto-return pause.
+    /// Failures and cancellations leave this `None` (they stay up until
+    /// acknowledged).
+    pub finished_at: Option<Instant>,
     /// Translated failure, once finished unsuccessfully.
     pub diagnosis: Option<Diagnosis>,
 }
@@ -161,6 +165,7 @@ impl RunState {
             pid: None,
             cancel_tx: None,
             result: None,
+            finished_at: None,
             diagnosis: None,
         }
     }
@@ -200,10 +205,14 @@ impl RunState {
 
     /// Fold the final result: compute the diagnosis for genuine failures
     /// and pick the next phase (delete prompt when a partial file exists).
+    /// Success stamps `finished_at` for the auto-return pause (§2).
     pub fn apply_finished(&mut self, result: JobResult) {
         if !result.success && !result.cancelled {
             let joined = result.stderr.join("\n");
             self.diagnosis = diagnose(&joined);
+        }
+        if result.success {
+            self.finished_at = Some(Instant::now());
         }
         self.result = Some(result);
         if self.output.exists() && !self.succeeded() {
@@ -274,13 +283,16 @@ pub enum RunAction {
 pub fn on_key(state: &mut RunState, key: KeyEvent) -> RunAction {
     match state.phase {
         RunPhase::ConfirmOverwrite => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => RunAction::Spawn,
+            // Enter confirms: it is the universal "go" key everywhere else
+            // in ffkit, and ignoring it here reads as a freeze on re-runs.
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => RunAction::Spawn,
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => RunAction::Back,
             _ => RunAction::None,
         },
         RunPhase::ConfirmDelete => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => RunAction::DeletePartial,
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            // Enter keeps the file (the safe default); only an explicit y deletes.
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
                 state.phase = RunPhase::Done;
                 RunAction::None
             }
@@ -306,6 +318,11 @@ pub fn on_key(state: &mut RunState, key: KeyEvent) -> RunAction {
         RunPhase::Done => match key.code {
             KeyCode::Enter | KeyCode::Esc => RunAction::Back,
             KeyCode::Char('c') => RunAction::CopyReport,
+            KeyCode::Char('l') => {
+                state.log_expanded = !state.log_expanded;
+                state.log_scroll = 0;
+                RunAction::None
+            }
             _ => RunAction::None,
         },
     }
@@ -343,8 +360,8 @@ pub fn render(frame: &mut Frame, app: &crate::app::App, theme: &Theme) {
     );
 
     let hints = match state.phase {
-        RunPhase::ConfirmOverwrite => "Output exists — y overwrite · n back",
-        RunPhase::ConfirmDelete => "Delete the partial file? y delete · n keep",
+        RunPhase::ConfirmOverwrite => "Output exists — y/Enter overwrite · n/Esc back",
+        RunPhase::ConfirmDelete => "Delete the partial file? y delete · n/Enter keep",
         RunPhase::Active => "Ctrl+C cancel · l log · c copy command · ↑↓ scroll log",
         RunPhase::Cancelling => "Terminating (SIGTERM)… second Ctrl+C force-kills · l log",
         RunPhase::Done => "Enter/Esc back · c copy error report · l log",
@@ -543,4 +560,41 @@ fn render_delete(frame: &mut Frame, area: ratatui::layout::Rect, state: &RunStat
             .title("Delete partial file?"),
     );
     frame.render_widget(body, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn confirming_state() -> RunState {
+        let spec = CommandSpec::new("ffmpeg");
+        RunState::confirming("Convert".into(), &spec, PathBuf::from("out.mp4"))
+    }
+
+    #[test]
+    fn enter_confirms_overwrite_like_y() {
+        let mut state = confirming_state();
+        assert!(matches!(
+            on_key(&mut state, key(KeyCode::Enter)),
+            RunAction::Spawn
+        ));
+        let mut state = confirming_state();
+        assert!(matches!(
+            on_key(&mut state, key(KeyCode::Char('y'))),
+            RunAction::Spawn
+        ));
+    }
+
+    #[test]
+    fn enter_on_delete_prompt_keeps_the_file() {
+        let mut state = confirming_state();
+        state.phase = RunPhase::ConfirmDelete;
+        on_key(&mut state, key(KeyCode::Enter));
+        assert_eq!(state.phase, RunPhase::Done);
+    }
 }

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tui_input::Input;
 
-use crate::ffmpeg::builder::{push_globals, safe_path_arg, CommandSpec};
+use crate::ffmpeg::builder::{push_globals, resolve_output, safe_path_arg, CommandSpec};
 use crate::ops::fields::{BuildContext, Field, FieldContext, FieldKind, SelectOption};
 use crate::ops::{simple_op, InputKind, Operation};
 
@@ -129,15 +129,18 @@ impl Operation for FramesOp {
             ));
         }
         let file_name = format!("{pattern}.{format}");
+        let default_out = match input.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(&file_name),
+            _ => PathBuf::from(&file_name),
+        };
         let output = match ctx.output {
             Some(path) if !path.as_os_str().is_empty() => {
                 let text = path.to_string_lossy().replace("{stem}", &stem);
-                PathBuf::from(text)
+                // Extensionless overrides gain the format extension —
+                // same rule as every other operation.
+                resolve_output(Some(&PathBuf::from(text)), default_out)
             }
-            _ => match input.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => parent.join(file_name),
-                _ => PathBuf::from(file_name),
-            },
+            _ => default_out,
         };
         // The output Text field doubles as the pattern override; an explicit
         // ctx.output from snapshots wins over the pattern field.

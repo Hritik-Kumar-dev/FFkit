@@ -56,6 +56,17 @@ fn text(value: &str) -> FieldValue {
 
 /// Minimal video+audio probe for matching tests.
 fn probe_video_audio(path: &str, vcodec: &str, acodec: &str) -> ffkit::ffmpeg::probe::ProbeResult {
+    probe_video_audio_dims(path, vcodec, acodec, 1280, 720)
+}
+
+/// Minimal probe with explicit dimensions (odd sizes reproduce §4).
+fn probe_video_audio_dims(
+    path: &str,
+    vcodec: &str,
+    acodec: &str,
+    width: u32,
+    height: u32,
+) -> ffkit::ffmpeg::probe::ProbeResult {
     use ffkit::ffmpeg::probe::{ProbeResult, StreamInfo, StreamType};
     ProbeResult {
         path: PathBuf::from(path),
@@ -67,8 +78,8 @@ fn probe_video_audio(path: &str, vcodec: &str, acodec: &str) -> ffkit::ffmpeg::p
             StreamInfo {
                 codec_type: Some(StreamType::Video),
                 codec_name: Some(vcodec.to_string()),
-                width: Some(1280),
-                height: Some(720),
+                width: Some(width),
+                height: Some(height),
                 ..StreamInfo::default()
             },
             StreamInfo {
@@ -460,4 +471,61 @@ fn every_operation_declares_fields() {
             id = op.id()
         );
     }
+}
+
+/// §4: odd-sized sources gain the even-preserving scale filter so
+/// block encoders stop refusing the encode; even sources are untouched.
+#[test]
+fn compress_odd_dimensions_get_even_filter() {
+    let op = operation_for("compress").expect("op exists");
+    let owned = OwnedCtx::new(
+        &["odd.mp4"],
+        Some("odd_c.mp4"),
+        &[
+            ("video_codec", text("libx264")),
+            ("video_mode", FieldValue::Toggle(0)),
+            ("crf", FieldValue::Int(23)),
+            ("preset", text("medium")),
+            ("audio_codec", text("aac")),
+            ("audio_bitrate", text("128k")),
+            ("resolution", text("")),
+        ],
+    )
+    .with_probes(vec![probe_video_audio_dims(
+        "odd.mp4", "mpeg4", "aac", 1092, 863,
+    )]);
+    let spec = op.build(&owned.view()).expect("build succeeds");
+    assert!(
+        spec.args
+            .contains(&"scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string()),
+        "odd dims must gain the guard filter, got {:?}",
+        spec.args
+    );
+}
+
+#[test]
+fn compress_even_dimensions_gain_no_filter() {
+    let op = operation_for("compress").expect("op exists");
+    let owned = OwnedCtx::new(
+        &["even.mp4"],
+        Some("even_c.mp4"),
+        &[
+            ("video_codec", text("libx264")),
+            ("video_mode", FieldValue::Toggle(0)),
+            ("crf", FieldValue::Int(23)),
+            ("preset", text("medium")),
+            ("audio_codec", text("aac")),
+            ("audio_bitrate", text("128k")),
+            ("resolution", text("")),
+        ],
+    )
+    .with_probes(vec![probe_video_audio_dims(
+        "even.mp4", "h264", "aac", 320, 240,
+    )]);
+    let spec = op.build(&owned.view()).expect("build succeeds");
+    assert!(
+        !spec.args.iter().any(|a| a.contains("trunc(")),
+        "even dims must not gain a filter, got {:?}",
+        spec.args
+    );
 }

@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -56,6 +56,9 @@ pub struct ParamForm {
     pub cmd_scroll: usize,
     /// A text field is being edited (global single-key bindings suspended).
     pub editing: bool,
+    /// The output field was just entered and its default is select-all:
+    /// the next printable char replaces it, Backspace clears it.
+    pub edit_select_all: bool,
 }
 
 impl ParamForm {
@@ -78,6 +81,7 @@ impl ParamForm {
             focus_cmd: false,
             cmd_scroll: 0,
             editing: false,
+            edit_select_all: false,
         };
         form.rebuild(op, inputs, probe, input_probes, caps);
         form
@@ -171,8 +175,15 @@ impl ParamForm {
                 self.focus_cmd = !self.focus_cmd;
             }
             KeyCode::Enter => {
-                if let Some(FieldKind::Text { .. }) = self.fields.get(self.focus).map(|f| &f.kind) {
-                    self.editing = true;
+                if let Some(field) = self.fields.get(self.focus) {
+                    if matches!(field.kind, FieldKind::Text { .. }) {
+                        self.editing = true;
+                        // The output default is select-all: typing replaces
+                        // it instead of appending to a long path.
+                        self.edit_select_all = field.id == "output";
+                    } else {
+                        return FormAction::Run;
+                    }
                 } else {
                     return FormAction::Run;
                 }
@@ -184,13 +195,38 @@ impl ParamForm {
     }
 
     /// Keys while a text field is being edited. Enter/Esc leave edit mode
-    /// (Esc does not go back — it only cancels editing).
+    /// (Esc does not go back — it only cancels editing). While select-all
+    /// is active (output field just entered), the first printable char
+    /// replaces the whole value and Backspace/Delete clears it; any other
+    /// key drops the selection and behaves normally.
     fn on_key_editing(&mut self, key: KeyEvent) -> FormAction {
         match key.code {
             KeyCode::Enter | KeyCode::Esc => {
                 self.editing = false;
+                self.edit_select_all = false;
+            }
+            KeyCode::Char(c) if self.edit_select_all && key.modifiers.is_empty() => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    if let FieldKind::Text { value } = &mut field.kind {
+                        *value = tui_input::Input::new(c.to_string());
+                        self.edit_select_all = false;
+                        return FormAction::Changed;
+                    }
+                }
+                self.edit_select_all = false;
+            }
+            KeyCode::Backspace | KeyCode::Delete if self.edit_select_all => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    if let FieldKind::Text { value } = &mut field.kind {
+                        *value = tui_input::Input::default();
+                        self.edit_select_all = false;
+                        return FormAction::Changed;
+                    }
+                }
+                self.edit_select_all = false;
             }
             _ => {
+                self.edit_select_all = false;
                 if let Some(field) = self.fields.get_mut(self.focus) {
                     if let FieldKind::Text { value } = &mut field.kind {
                         value.handle_event(&crossterm::event::Event::Key(key));
@@ -304,7 +340,8 @@ fn render_fields(frame: &mut Frame, area: Rect, form: &ParamForm, theme: &Theme)
         let focused = i == form.focus && !form.focus_cmd;
         let marker = if focused { "▸ " } else { "  " };
         let label = format!("{marker}{}", field.label);
-        let control = render_control(field, focused, theme);
+        let select_all = focused && form.editing && form.edit_select_all;
+        let control = render_control(field, focused, select_all, theme);
         let mut spans = vec![Span::styled(label, label_style(focused, theme))];
         spans.push(Span::raw("  "));
         spans.extend(control);
@@ -404,8 +441,14 @@ fn render_info(frame: &mut Frame, area: Rect, app: &crate::app::App, theme: &The
     frame.render_widget(panel, area);
 }
 
-/// Render one control (the value half of a row).
-fn render_control(field: &Field, focused: bool, theme: &Theme) -> Vec<Span<'static>> {
+/// Render one control (the value half of a row). `select_all` paints a
+/// text value fully selected (output field just entered — typing replaces).
+fn render_control(
+    field: &Field,
+    focused: bool,
+    select_all: bool,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     let highlight = |text: String| {
         if focused {
             Span::styled(text, theme.selected())
@@ -464,7 +507,16 @@ fn render_control(field: &Field, focused: bool, theme: &Theme) -> Vec<Span<'stat
             } else {
                 text
             };
-            vec![highlight(format!("[{shown}]"))]
+            if select_all {
+                // Focus paints the control selected already; the underline
+                // marks "typing replaces everything".
+                vec![Span::styled(
+                    format!("[{shown}]"),
+                    theme.selected().add_modifier(Modifier::UNDERLINED),
+                )]
+            } else {
+                vec![highlight(format!("[{shown}]"))]
+            }
         }
     }
 }
@@ -591,12 +643,86 @@ fn edit_cursor(form: &ParamForm, area: Rect) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::diff_token;
+    use super::{FormAction, ParamForm};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// Build a one-field output form for editing tests.
+    fn output_form() -> ParamForm {
+        use crate::ops::fields::{Field, FieldKind};
+        ParamForm {
+            op_id: "convert".to_string(),
+            fields: vec![Field {
+                id: "output",
+                label: "Output".to_string(),
+                kind: FieldKind::Text {
+                    value: tui_input::Input::new("clip_converted.mp4".to_string()),
+                },
+                explanation: String::new(),
+            }],
+            focus: 0,
+            preview: None,
+            build_error: None,
+            changed: None,
+            focus_cmd: false,
+            cmd_scroll: 0,
+            editing: false,
+            edit_select_all: false,
+        }
+    }
+
+    fn output_value(form: &ParamForm) -> String {
+        use crate::ops::fields::FieldKind;
+        match &form.fields[0].kind {
+            FieldKind::Text { value } => value.value().to_string(),
+            _ => unreachable!(),
+        }
+    }
 
     #[test]
     fn diff_finds_value_change_with_flag() {
         let old = vec!["-crf".to_string(), "23".to_string()];
         let new = vec!["-crf".to_string(), "20".to_string()];
         assert_eq!(diff_token(&old, &new), Some("-crf 20".to_string()));
+    }
+
+    #[test]
+    fn output_field_selects_all_on_enter() {
+        let mut form = output_form();
+        form.on_key(key(KeyCode::Enter));
+        assert!(form.editing);
+        assert!(form.edit_select_all);
+    }
+
+    #[test]
+    fn typing_replaces_selected_output() {
+        let mut form = output_form();
+        form.on_key(key(KeyCode::Enter));
+        let action = form.on_key(key(KeyCode::Char('m')));
+        assert_eq!(action, FormAction::Changed);
+        assert_eq!(output_value(&form), "m");
+        assert!(!form.edit_select_all);
+    }
+
+    #[test]
+    fn backspace_clears_selected_output() {
+        let mut form = output_form();
+        form.on_key(key(KeyCode::Enter));
+        let action = form.on_key(key(KeyCode::Backspace));
+        assert_eq!(action, FormAction::Changed);
+        assert_eq!(output_value(&form), "");
+    }
+
+    #[test]
+    fn arrows_drop_selection_without_editing() {
+        let mut form = output_form();
+        form.on_key(key(KeyCode::Enter));
+        form.on_key(key(KeyCode::Left));
+        assert!(!form.edit_select_all);
+        assert_eq!(output_value(&form), "clip_converted.mp4");
     }
 
     #[test]

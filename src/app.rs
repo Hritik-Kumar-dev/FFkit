@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -261,10 +262,41 @@ impl App {
         self.status_message = None;
     }
 
-    /// Tick handler: advances the startup spinner. Debounced refreshes and
-    /// ETA smoothing arrive in M4.
+    /// Tick handler: advances the startup spinner and drives the §2
+    /// auto-return — a successful job shows its final stats for
+    /// [`SUCCESS_PAUSE`] then returns to the picker without a keypress.
+    /// Failures and cancellations stay until acknowledged.
     pub fn on_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+        if self.screen == Screen::Running {
+            let ready = self.run.as_ref().is_some_and(|run| {
+                run.phase == RunPhase::Done
+                    && run.succeeded()
+                    && run
+                        .finished_at
+                        .is_some_and(|at| at.elapsed() >= SUCCESS_PAUSE)
+            });
+            if ready {
+                self.status_message = self.success_summary();
+                self.screen = Screen::OperationPicker;
+            }
+        }
+    }
+
+    /// One-line success summary carried back to the picker.
+    fn success_summary(&self) -> Option<String> {
+        let run = self.run.as_ref()?;
+        let wall = run.result.as_ref().map(|r| r.wall_time)?;
+        let size = std::fs::metadata(&run.output)
+            .ok()
+            .map(|m| crate::ffmpeg::probe::format_size(m.len()))
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        Some(format!(
+            "Done in {:.1}s → {}{size}",
+            wall.as_secs_f64(),
+            run.output.display()
+        ))
     }
 
     /// Global key dispatch. Picker navigation supports both arrows and vim
@@ -990,12 +1022,38 @@ impl App {
     }
 
     /// Keys on the running screen: prompts, log pane, exit, report copy.
+    /// During the §2 success pause, any key except `c`/`l` dismisses early
+    /// to the picker; failures stay until explicitly acknowledged.
     fn on_key_running(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('?') {
             self.screen = Screen::Help {
                 return_to: Box::new(Screen::Running),
             };
             return;
+        }
+        if self
+            .run
+            .as_ref()
+            .is_some_and(|run| run.phase == RunPhase::Done && run.succeeded())
+        {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.copy_report();
+                    return;
+                }
+                KeyCode::Char('l') => {
+                    if let Some(run) = self.run.as_mut() {
+                        run.log_expanded = !run.log_expanded;
+                        run.log_scroll = 0;
+                    }
+                    return;
+                }
+                _ => {
+                    self.status_message = self.success_summary();
+                    self.screen = Screen::OperationPicker;
+                    return;
+                }
+            }
         }
         let action = match self.run.as_mut() {
             Some(run) => crate::ui::screens::running::on_key(run, key),
@@ -1092,6 +1150,9 @@ impl App {
         }
     }
 }
+
+/// How long the success card stays up before auto-returning to the picker.
+const SUCCESS_PAUSE: Duration = Duration::from_millis(1800);
 
 /// Spinner frames for the startup loading screen.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1426,5 +1487,219 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(content.contains("Job queue"), "{content}");
+    }
+
+    /// §2: a successful job auto-returns to the picker after the pause,
+    /// carrying its summary — no keypress required.
+    #[test]
+    fn success_auto_returns_after_pause() {
+        use crate::ffmpeg::runner::JobResult;
+        use crate::ui::screens::running::RunState;
+
+        let mut app = test_app();
+        let spec = crate::ffmpeg::builder::CommandSpec::new("ffmpeg");
+        let mut run = RunState::starting(
+            "Convert".into(),
+            &spec,
+            PathBuf::from("out.mp4"),
+            None,
+            None,
+        );
+        run.phase = RunPhase::Done;
+        run.result = Some(JobResult {
+            success: true,
+            cancelled: false,
+            exit_code: Some(0),
+            stderr: Vec::new(),
+            wall_time: std::time::Duration::from_secs(3),
+        });
+        run.finished_at = Some(std::time::Instant::now() - SUCCESS_PAUSE);
+        app.run = Some(run);
+        app.screen = Screen::Running;
+
+        app.on_tick();
+        assert_eq!(app.screen, Screen::OperationPicker);
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|s| s.contains("out.mp4")),
+            "summary must name the output, got {:?}",
+            app.status_message
+        );
+    }
+
+    /// §2: fresh successes and failures stay put until acknowledged.
+    #[test]
+    fn fresh_success_and_failure_do_not_auto_return() {
+        use crate::ffmpeg::runner::JobResult;
+        use crate::ui::screens::running::RunState;
+
+        for success in [true, false] {
+            let mut app = test_app();
+            let spec = crate::ffmpeg::builder::CommandSpec::new("ffmpeg");
+            let mut run = RunState::starting(
+                "Convert".into(),
+                &spec,
+                PathBuf::from("out.mp4"),
+                None,
+                None,
+            );
+            run.phase = RunPhase::Done;
+            run.result = Some(JobResult {
+                success,
+                cancelled: false,
+                exit_code: Some(i32::from(!success)),
+                stderr: Vec::new(),
+                wall_time: std::time::Duration::from_secs(1),
+            });
+            if success {
+                run.finished_at = Some(std::time::Instant::now());
+            }
+            app.run = Some(run);
+            app.screen = Screen::Running;
+            app.on_tick();
+            assert_eq!(app.screen, Screen::Running, "success={success}");
+        }
+    }
+
+    /// §2: any key during the success pause dismisses early — except `c`
+    /// (copy) and `l` (log), which stay.
+    #[test]
+    fn any_key_dismisses_success_pause_early() {
+        use crate::ffmpeg::runner::JobResult;
+        use crate::ui::screens::running::RunState;
+
+        let mut app = test_app();
+        let spec = crate::ffmpeg::builder::CommandSpec::new("ffmpeg");
+        let mut run = RunState::starting(
+            "Convert".into(),
+            &spec,
+            PathBuf::from("out.mp4"),
+            None,
+            None,
+        );
+        run.phase = RunPhase::Done;
+        run.result = Some(JobResult {
+            success: true,
+            cancelled: false,
+            exit_code: Some(0),
+            stderr: Vec::new(),
+            wall_time: std::time::Duration::from_secs(1),
+        });
+        run.finished_at = Some(std::time::Instant::now());
+        app.run = Some(run);
+        app.screen = Screen::Running;
+
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.screen, Screen::OperationPicker);
+    }
+
+    /// §1 repro: convert the same file three times without restarting.
+    /// Each run must complete or prompt-and-proceed — never hang on
+    /// ffmpeg's interactive overwrite prompt. Fails by timeout on a hang.
+    #[tokio::test]
+    async fn convert_same_file_three_times_never_hangs() {
+        let Some(ffmpeg) = which::which("ffmpeg").ok() else {
+            println!("skipping: no ffmpeg on PATH");
+            return;
+        };
+        let dir: PathBuf = std::env::temp_dir().join(format!("ffkit-sect1-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let input = dir.join("clip.mp4");
+        let status = tokio::process::Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=10:duration=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&input)
+            .status()
+            .await
+            .expect("generate sample");
+        assert!(status.success());
+
+        let mut app = test_app();
+        app.caps = Some(CapabilityReport {
+            found: true,
+            usable: true,
+            ffmpeg_path: Some(ffmpeg),
+            ffprobe_path: which::which("ffprobe").ok(),
+            ..CapabilityReport::default()
+        });
+        app.selected_operation = 0; // Convert
+        app.form_inputs = vec![input];
+        app.open_form();
+        assert!(app.form.is_some(), "convert form must open");
+
+        for round in 1..=3 {
+            // The exact argv about to be spawned — the §1 investigation.
+            let preview = app
+                .form
+                .as_ref()
+                .and_then(|form| form.preview.clone())
+                .expect("preview must exist");
+            assert!(
+                preview.args.contains(&"-y".to_string()),
+                "round {round}: -y must reach the child, got {:?}",
+                preview.args
+            );
+            app.start_single_flow();
+            // Runs 2+ hit the overwrite confirm; answer like a user would —
+            // round 2 with Enter (the §1 fix), round 3 with y.
+            if app
+                .run
+                .as_ref()
+                .is_some_and(|run| run.phase == RunPhase::ConfirmOverwrite)
+            {
+                app.screen = Screen::Running;
+                let confirm = if round == 2 {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char('y')
+                };
+                app.on_key(key(confirm));
+                assert!(
+                    app.run
+                        .as_ref()
+                        .is_some_and(|run| run.phase == RunPhase::Active),
+                    "round {round}: confirm must spawn the job"
+                );
+            }
+            let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                loop {
+                    app.poll_background();
+                    let done = app.run.as_ref().is_some_and(|run| {
+                        matches!(run.phase, RunPhase::Done | RunPhase::ConfirmDelete)
+                    });
+                    if done {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            assert!(
+                settled.is_ok(),
+                "round {round}: job never settled — hang reproduced"
+            );
+            let run = app.run.as_ref().expect("run state");
+            assert!(
+                run.succeeded(),
+                "round {round}: job must succeed, stderr: {:?}",
+                run.result.as_ref().map(|r| r.stderr_tail(5))
+            );
+            // Dismiss the delete prompt if a partial file tripped it.
+            if run.phase == RunPhase::ConfirmDelete {
+                app.on_key(key(KeyCode::Char('n')));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
