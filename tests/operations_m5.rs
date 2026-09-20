@@ -1,7 +1,6 @@
-//! M5 operation snapshot tests: exact argv for the eight operations that
-//! landed in M5 (extract-audio, resize, gif, thumbnail, frames, subtitles,
-//! image-convert, concat). Compress/convert/trim live in
-//! `tests/builder_snapshots.rs`.
+//! M5 operation snapshot tests: exact argv for the operations that landed
+//! in M5 (extract-audio, resize, gif, frames, subtitles, image-convert,
+//! concat). Compress/convert/trim live in `tests/builder_snapshots.rs`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -235,38 +234,6 @@ fn gif_emits_palettegen_then_paletteuse() {
     assert!(complex.contains("paletteuse"), "{complex}");
     assert!(spec.args.contains(&"-loop".to_string()));
     assert_eq!(spec.args.last().map(String::as_str), Some("clip_anim.gif"));
-}
-
-#[test]
-fn thumbnail_seeks_before_input_for_speed() {
-    let op = operation_for("thumbnail").expect("op exists");
-    let owned = OwnedCtx::new(
-        &["clip.mp4"],
-        Some("thumb.png"),
-        &[
-            ("timestamp", text("00:00:05")),
-            ("format", text("png")),
-            ("size", text("")),
-        ],
-    );
-    let spec = op.build(&owned.view()).expect("build succeeds");
-    assert_eq!(
-        spec.args,
-        vec![
-            "-hide_banner",
-            "-y",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            "-ss",
-            "00:00:05",
-            "-i",
-            "clip.mp4",
-            "-frames:v",
-            "1",
-            "thumb.png",
-        ]
-    );
 }
 
 #[test]

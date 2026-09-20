@@ -37,7 +37,7 @@ pub enum Screen {
     Startup,
     /// No ffmpeg binary found (or the found one is unusable).
     MissingFfmpeg,
-    /// Pick one of the eleven operations.
+    /// Pick one of the ten operations.
     OperationPicker,
     /// Choose input file(s).
     FileBrowser,

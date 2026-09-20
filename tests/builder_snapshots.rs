@@ -4,7 +4,7 @@
 //! parameter combinations, asserting the exact argv vector. A regression
 //! here produces silently wrong commands, so these tests are exact.
 //!
-//! M3 covers compress/convert/trim; M5 extends to all eleven operations.
+//! M3 covers compress/convert/trim; M5 covered the rest (thumbnail since removed).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -47,7 +47,7 @@ fn text(value: &str) -> FieldValue {
 }
 
 #[test]
-fn registry_lists_eleven_operations_in_menu_order() {
+fn registry_lists_ten_operations_in_menu_order() {
     let ids: Vec<&str> = OPERATIONS.iter().map(|op| op.id).collect();
     assert_eq!(
         ids,
@@ -58,7 +58,6 @@ fn registry_lists_eleven_operations_in_menu_order() {
             "extract-audio",
             "resize",
             "gif",
-            "thumbnail",
             "frames",
             "concat",
             "subtitles",
@@ -308,7 +307,7 @@ fn convert_mp4_adds_faststart() {
 }
 
 #[test]
-fn all_eleven_operations_are_implemented() {
+fn all_operations_are_implemented() {
     // M5 implemented everything — this test asserts the factory covers the
     // registry instead of expecting failures.
     for op in OPERATIONS {

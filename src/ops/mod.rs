@@ -14,7 +14,6 @@ pub mod gif;
 pub mod image_convert;
 pub mod resize;
 pub mod subtitles;
-pub mod thumbnail;
 pub mod trim;
 
 use anyhow::Result;
@@ -71,8 +70,6 @@ pub trait Operation {
 
 /// Macro stamping out an operation's struct plus its static registry
 /// metadata. The [`Operation`] impl (fields/build) lives in each submodule.
-/// M5 implements all eleven; the macro keeps id/name/description next to
-/// the code instead of in a far-away table.
 macro_rules! simple_op {
     ($type:ident, $id:expr, $name:expr, $desc:expr, $accepts:expr) => {
         /// Operation marker type; see the [`Operation`] impl below.
@@ -101,7 +98,6 @@ pub const OPERATIONS: &[OperationMeta] = &[
     extract_audio::ExtractAudioOp::META,
     resize::ResizeOp::META,
     gif::GifOp::META,
-    thumbnail::ThumbnailOp::META,
     frames::FramesOp::META,
     concat::ConcatOp::META,
     subtitles::SubtitlesOp::META,
@@ -124,7 +120,6 @@ pub fn operation_for(id: &str) -> Option<Box<dyn Operation>> {
         "extract-audio" => Some(Box::new(extract_audio::ExtractAudioOp)),
         "resize" => Some(Box::new(resize::ResizeOp)),
         "gif" => Some(Box::new(gif::GifOp)),
-        "thumbnail" => Some(Box::new(thumbnail::ThumbnailOp)),
         "frames" => Some(Box::new(frames::FramesOp)),
         "concat" => Some(Box::new(concat::ConcatOp)),
         "subtitles" => Some(Box::new(subtitles::SubtitlesOp)),
@@ -139,8 +134,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn registry_has_all_eleven_operations() {
-        assert_eq!(OPERATIONS.len(), 11);
+    fn registry_has_all_ten_operations() {
+        assert_eq!(OPERATIONS.len(), 10);
     }
 
     #[test]
