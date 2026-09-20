@@ -24,7 +24,7 @@ fn wait_done(rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackgroundMsg>) -> (b
 }
 
 #[test]
-fn scratch_runner_vs_direct_wall_time() {
+fn runner_matches_direct_wall_time() {
     let Some(bin) = which::which("ffmpeg").ok() else {
         println!("skipping: no ffmpeg");
         return;
@@ -124,6 +124,102 @@ fn scratch_runner_vs_direct_wall_time() {
             );
             assert!(out.exists());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// §6: resize with center crop through the full stack — guards the
+/// backslash-comma escaping and verifies real output dimensions.
+/// Skips gracefully where FFmpeg is not installed.
+#[test]
+fn resize_crop_produces_square_live() {
+    use ffkit::ops::fields::{BuildContext, FieldValue};
+    use ffkit::ops::operation_for;
+    use std::collections::HashMap;
+
+    let Some(bin) = which::which("ffmpeg").ok() else {
+        println!("skipping: no ffmpeg");
+        return;
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("ffkit-resizelive-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let input = dir.join("src.mp4");
+        let status = tokio::process::Command::new(&bin)
+            .args([
+                "-hide_banner",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=1092x863:rate=10:duration=1",
+                "-c:v",
+                "mpeg4",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&input)
+            .status()
+            .await
+            .expect("generate odd-sized sample");
+        assert!(status.success());
+
+        let text = |v: &str| FieldValue::Text(v.to_string());
+        let op = operation_for("resize").unwrap();
+        let output = dir.join("square.mp4");
+        let mut fields = HashMap::new();
+        fields.insert("preset", text("1280:-2"));
+        fields.insert("custom_w", text(""));
+        fields.insert("custom_h", text(""));
+        fields.insert("aspect", FieldValue::Toggle(0));
+        fields.insert("crop", text("square"));
+        fields.insert("video_codec", text("libx264"));
+        fields.insert("crf", FieldValue::Int(23));
+        let ctx = BuildContext {
+            inputs: std::slice::from_ref(&input),
+            output: Some(&output),
+            probe: None,
+            input_probes: Vec::new(),
+            caps: None,
+            fields,
+        };
+        let spec = op.build(&ctx).expect("resize builds");
+        let (tx, mut rx) = unbounded_channel();
+        let (_cancel, cancel) = tokio::sync::oneshot::channel();
+        spawn_job(
+            tx,
+            JobRequest {
+                spec,
+                output: output.clone(),
+            },
+            cancel,
+            0,
+        );
+        let (ok, _) = tokio::task::spawn_blocking(move || wait_done(&mut rx))
+            .await
+            .unwrap();
+        assert!(ok, "crop run must succeed");
+        let probed = tokio::process::Command::new(which::which("ffprobe").unwrap())
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&output)
+            .output()
+            .await
+            .expect("probe output");
+        assert_eq!(String::from_utf8_lossy(&probed.stdout).trim(), "1280,1280");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
