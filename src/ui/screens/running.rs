@@ -45,6 +45,8 @@ pub enum RunPhase {
 pub struct RunState {
     /// Which operation launched this job (display only).
     pub op_name: String,
+    /// Input being processed — matches probe arrivals for backfill.
+    pub input: Option<PathBuf>,
     /// Shared job-id space with the queue (0 reserved for nothing — every
     /// spawn takes an id, so late messages can never hit the wrong job).
     pub job_id: u64,
@@ -103,13 +105,19 @@ pub struct RunState {
 impl RunState {
     /// Fresh state behind the overwrite confirm. The confirm resolves
     /// before any process spawns, so `-y` is never a surprise.
-    pub fn confirming(op_name: String, spec: &CommandSpec, output: PathBuf) -> Self {
+    pub fn confirming(
+        op_name: String,
+        spec: &CommandSpec,
+        output: PathBuf,
+        total_duration: Option<Duration>,
+        input_size: Option<u64>,
+    ) -> Self {
         Self::new(
             op_name,
             spec,
             output,
-            None,
-            None,
+            total_duration,
+            input_size,
             RunPhase::ConfirmOverwrite,
         )
     }
@@ -142,6 +150,7 @@ impl RunState {
     ) -> Self {
         Self {
             op_name,
+            input: None,
             job_id: u64::MAX,
             spec: spec.clone(),
             display_command: spec.to_display(),
@@ -484,7 +493,7 @@ fn success_line(state: &RunState, theme: &Theme) -> Vec<Span<'static>> {
         _ => String::new(),
     };
     vec![
-        Span::styled("Finished", theme.command_style()),
+        Span::styled("✓ Completed successfully", theme.command_style()),
         Span::styled(
             format!(
                 " in {}{comparison}",
@@ -581,7 +590,13 @@ mod tests {
 
     fn confirming_state() -> RunState {
         let spec = CommandSpec::new("ffmpeg");
-        RunState::confirming("Convert".into(), &spec, PathBuf::from("out.mp4"))
+        RunState::confirming(
+            "Convert".into(),
+            &spec,
+            PathBuf::from("out.mp4"),
+            None,
+            None,
+        )
     }
 
     #[test]

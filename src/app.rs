@@ -238,6 +238,17 @@ impl App {
                 if self.trim.as_ref().is_some_and(|trim| trim.input == path) {
                     self.refresh_trim_probe();
                 }
+                // A probe landing mid-run backfills the countdown total:
+                // without this, starting before the probe finished left
+                // `remaining --:--` and an indeterminate bar forever (§12).
+                if let Some(run) = self.run.as_mut() {
+                    if run.total_duration.is_none() && run.input.as_ref() == Some(&path) {
+                        run.total_duration = self.probes.get(&path).and_then(|state| match state {
+                            ProbeState::Ready(result) => result.duration,
+                            ProbeState::Pending | ProbeState::Failed(_) => None,
+                        });
+                    }
+                }
             }
             BackgroundMsg::JobStarted { job_id, pid } => {
                 if self.run.as_ref().is_some_and(|run| run.job_id == job_id) {
@@ -883,7 +894,13 @@ impl App {
         input_size: Option<u64>,
     ) {
         if output.exists() && self.settings.general.confirm_overwrite {
-            self.run = Some(RunState::confirming(op_name, &spec, output));
+            self.run = Some(RunState::confirming(
+                op_name,
+                &spec,
+                output,
+                total_duration,
+                input_size,
+            ));
         } else {
             self.run = Some(RunState::starting(
                 op_name,
@@ -893,6 +910,11 @@ impl App {
                 input_size,
             ));
             self.spawn_current_job();
+        }
+        // The run remembers its input so a probe landing mid-run can
+        // backfill the total duration (§12 follow-up).
+        if let Some(run) = self.run.as_mut() {
+            run.input = self.form_inputs.first().cloned();
         }
         self.screen = Screen::Running;
         self.status_message = None;
@@ -2074,5 +2096,156 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Single runs carry the probe duration into the job so the countdown
+    /// has a total to count down from (regression test for §12 follow-up).
+    /// Covers both launch branches: direct spawn and overwrite-confirm
+    /// (the confirm path used to drop the total entirely).
+    #[tokio::test]
+    async fn single_flow_carries_probe_duration() {
+        use crate::ffmpeg::probe::{ProbeResult, StreamInfo, StreamType};
+        use crate::ui::screens::parameter_form::ParamForm;
+
+        let dir: PathBuf = std::env::temp_dir().join(format!("ffkit-total-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // Hermetic output: the crate root must not influence the branch.
+        let output = dir.join("clip_converted.mp4");
+
+        let mut app = test_app();
+        let op = operation_for("convert").expect("convert exists");
+        let input = PathBuf::from("clip.mp4");
+        app.form_inputs = vec![input.clone()];
+        app.probes.insert(
+            input,
+            ProbeState::Ready(ProbeResult {
+                path: PathBuf::from("clip.mp4"),
+                duration: Some(std::time::Duration::from_secs(80)),
+                size_bytes: Some(1000),
+                format_name: Some("mp4".to_string()),
+                bit_rate_bps: None,
+                streams: vec![StreamInfo {
+                    codec_type: Some(StreamType::Video),
+                    codec_name: Some("h264".to_string()),
+                    ..StreamInfo::default()
+                }],
+            }),
+        );
+        // Point the form's output field at the hermetic path.
+        let mut form = ParamForm::new(&*op, &app.form_inputs.clone(), None, Vec::new(), None);
+        for field in form.fields.iter_mut() {
+            if field.id == "output" {
+                if let crate::ops::fields::FieldKind::Text { value } = &mut field.kind {
+                    *value = tui_input::Input::new(output.to_string_lossy().into_owned());
+                }
+            }
+        }
+        app.form = Some(form);
+
+        // Round 1: direct spawn carries the total.
+        app.start_single_flow();
+        let run = app.run.as_ref().expect("run state");
+        assert_eq!(run.total_duration, Some(std::time::Duration::from_secs(80)));
+        assert_eq!(run.phase, RunPhase::Active);
+        // Settle round 1 (the spawned job fails fast on the missing input)
+        // so round 2 exercises the confirm path, not the busy guard.
+        for _ in 0..100 {
+            app.poll_background();
+            if app
+                .run
+                .as_ref()
+                .is_some_and(|run| matches!(run.phase, RunPhase::Done | RunPhase::ConfirmDelete))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Round 2: output exists → confirm path must keep the total too.
+        std::fs::write(&output, b"existing").expect("stage existing output");
+        app.start_single_flow();
+        let run = app.run.as_ref().expect("run state");
+        assert_eq!(run.phase, RunPhase::ConfirmOverwrite);
+        assert_eq!(
+            run.total_duration,
+            Some(std::time::Duration::from_secs(80)),
+            "confirm path must not drop the countdown total"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §12 follow-up: a probe landing mid-run backfills the countdown
+    /// total instead of leaving `--:--` for the whole job.
+    #[test]
+    fn probe_landing_mid_run_backfills_total() {
+        use crate::ffmpeg::probe::{ProbeResult, StreamInfo, StreamType};
+        use crate::ui::screens::running::RunState;
+
+        let mut app = test_app();
+        let spec = crate::ffmpeg::builder::CommandSpec::new("ffmpeg");
+        let mut run = RunState::starting(
+            "Convert".into(),
+            &spec,
+            PathBuf::from("out.mp4"),
+            None,
+            None,
+        );
+        run.input = Some(PathBuf::from("clip.mp4"));
+        run.phase = RunPhase::Active;
+        app.run = Some(run);
+        app.screen = Screen::Running;
+
+        let path = PathBuf::from("clip.mp4");
+        app.handle_msg(BackgroundMsg::ProbeReady {
+            path: path.clone(),
+            result: Ok(ProbeResult {
+                path,
+                duration: Some(std::time::Duration::from_secs(80)),
+                size_bytes: None,
+                format_name: None,
+                bit_rate_bps: None,
+                streams: vec![StreamInfo {
+                    codec_type: Some(StreamType::Video),
+                    codec_name: Some("h264".to_string()),
+                    ..StreamInfo::default()
+                }],
+            }),
+        });
+        assert_eq!(
+            app.run.as_ref().and_then(|r| r.total_duration),
+            Some(std::time::Duration::from_secs(80))
+        );
+    }
+
+    /// §12 follow-up: probes for other files never touch the run total.
+    #[test]
+    fn unrelated_probes_do_not_touch_run_total() {
+        use crate::ffmpeg::probe::ProbeResult;
+        use crate::ui::screens::running::RunState;
+
+        let mut app = test_app();
+        let spec = crate::ffmpeg::builder::CommandSpec::new("ffmpeg");
+        let mut run = RunState::starting(
+            "Convert".into(),
+            &spec,
+            PathBuf::from("out.mp4"),
+            None,
+            None,
+        );
+        run.input = Some(PathBuf::from("clip.mp4"));
+        app.run = Some(run);
+        let path = PathBuf::from("other.mp4");
+        app.handle_msg(BackgroundMsg::ProbeReady {
+            path: path.clone(),
+            result: Ok(ProbeResult {
+                path,
+                duration: Some(std::time::Duration::from_secs(80)),
+                size_bytes: None,
+                format_name: None,
+                bit_rate_bps: None,
+                streams: Vec::new(),
+            }),
+        });
+        assert_eq!(app.run.as_ref().and_then(|r| r.total_duration), None);
     }
 }
