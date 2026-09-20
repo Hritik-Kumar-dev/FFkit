@@ -27,6 +27,17 @@ simple_op!(
 /// (Label, extension); encoder mapping lives in [`quality_args`].
 const FORMATS: &[(&str, &str)] = &[("PNG", "png"), ("JPEG", "jpg"), ("WebP", "webp")];
 
+/// Explicit encoder per format. Emitted as `-c:v` on every build so the
+/// bytes on disk always match the selected format — never whatever encoder
+/// the output file's extension happens to imply.
+fn encoder_for(format: &str) -> &'static str {
+    match format {
+        "jpg" => "mjpeg",
+        "webp" => "libwebp",
+        _ => "png",
+    }
+}
+
 /// Quality flags for `quality` in 1..=100, or `None` when the format is
 /// lossless and the slider does not apply.
 fn quality_args(format: &str, quality: i64) -> Option<(String, String)> {
@@ -76,6 +87,13 @@ impl Operation for ImageConvertOp {
             .probe
             .map(|p| p.path.clone())
             .unwrap_or_else(|| "photo.png".into());
+        // The output default follows the default-selected format so the
+        // two agree out of the box (a stale pairing here is exactly how
+        // "the format didn't change" reports happen).
+        let default_format = formats
+            .get(default_selected(&formats))
+            .map(|o| o.value.clone())
+            .unwrap_or_else(|| "jpg".to_string());
 
         vec![
             Field {
@@ -85,7 +103,7 @@ impl Operation for ImageConvertOp {
                     selected: default_selected(&formats),
                     options: formats,
                 },
-                explanation: "Output image format. Applied to every selected file in the queue (M6 runs the batch).".into(),
+                explanation: "Output image format. Keep the Output extension in sync with it — the bytes always follow this choice (-c:v), but a mismatched extension lies about them.".into(),
             },
             Field {
                 id: "quality",
@@ -123,7 +141,7 @@ impl Operation for ImageConvertOp {
                 label: "Output".into(),
                 kind: FieldKind::Text {
                     value: Input::new(
-                        default_output_name(&input, "converted", "jpg")
+                        default_output_name(&input, "converted", &default_format)
                             .to_string_lossy()
                             .into_owned(),
                     ),
@@ -157,6 +175,12 @@ impl Operation for ImageConvertOp {
                 "Downscale, preserving aspect with even dimensions.",
             );
         }
+        let encoder = encoder_for(&format);
+        spec.flag_value(
+            "-c:v",
+            encoder,
+            format!("Image encoder for {format} — the bytes follow this choice, not the filename."),
+        );
         match quality_args(&format, ctx.get_int("quality", 85)) {
             Some((flag, value)) => {
                 spec.flag_value(

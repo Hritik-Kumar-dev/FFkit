@@ -366,6 +366,27 @@ fn image_convert_jpeg_maps_quality() {
     );
     let spec = op.build(&owned.view()).expect("build succeeds");
     assert!(spec.args.contains(&"-q:v".to_string()), "{:?}", spec.args);
+    assert!(spec.args.contains(&"-c:v".to_string()));
+    assert!(spec.args.contains(&"mjpeg".to_string()));
+}
+
+#[test]
+fn image_convert_encoder_follows_format_not_filename() {
+    // §9: JPG input asking for PNG must get PNG bytes even though the
+    // output name ends in .jpg — the encoder flag decides, not luck.
+    let op = operation_for("image-convert").expect("op exists");
+    let owned = OwnedCtx::new(
+        &["photo.jpg"],
+        Some("photo_converted.jpg"),
+        &[
+            ("format", text("png")),
+            ("quality", FieldValue::Int(85)),
+            ("resize", text("")),
+        ],
+    );
+    let spec = op.build(&owned.view()).expect("build succeeds");
+    let c_v = spec.args.iter().position(|a| a == "-c:v").expect("-c:v");
+    assert_eq!(spec.args[c_v + 1], "png", "{:?}", spec.args);
 }
 
 #[test]
