@@ -237,6 +237,31 @@ Log every deviation here. Format: what the spec says, what we did, why.
 47. **§7 thumbnail removed** (registry now ten). Also: user media dropped
     in `tests/` is gitignored from here on — fixtures stay `.json`.
 
+## Fix pass 2 (§10 timeline trim)
+
+48. **Measured, not theorized.** `-to` after input `-ss` counts on the
+    shifted output timeline (cut [1,5] for a [1,4] intent — wrong range,
+    and the old snapshots asserted it). Fast cuts use `-t` length now.
+    Stream-copied segments keep ragged timestamps that the concat demuxer
+    stacks wrong (measured 7.4s for a 6s join; `-fflags +genpts` does not
+    fix it). So: fast multi-clips join via the re-encoding concat filter
+    (6.40s live), accurate multi-clips via demuxer (6.02s live) — each path
+    verified against real ffmpeg before keeping it.
+49. **Single shared `single_clip` builder** for N=1 and every intermediate;
+    shared `demuxer_args`/`filter_args` with concat (both directions use
+    them). Output order follows timeline position (documented default per
+    the task). One mode toggle for all clips (documented).
+50. **No Sixel encoder.** Kitty + iTerm2 inline images, colored-block
+    approximation via the `image` crate, timestamp ticks as fallback.
+    Sixel-capable terminals get blocks — encoding Sixel by hand was judged
+    out of proportion, and blocks work on all of them.
+51. **Inline images bypass ratatui** (payloads print post-draw; re-emitted
+    only when dirty; explicitly cleared on screen exit) because escape
+    sequences inside buffered cells corrupt the diff engine.
+52. **Tab cycles handles** (spec-literal); zones switch with `f`/arrows.
+    Mouse support explicitly out. No probe duration → track waits with a
+    note instead of guessing geometry.
+
 ## Perf diagnostic ("slower than ffmpeg directly")
 
 37. **No overhead found in the encode path; fixed the one real hotspot.**

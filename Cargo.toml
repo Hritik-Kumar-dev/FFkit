@@ -34,3 +34,5 @@ arboard = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tui-input = "0.15"
+# Filmstrip block approximation (§10): decode thumbnails to average colors.
+image = "0.25"

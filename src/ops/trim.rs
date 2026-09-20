@@ -1,20 +1,22 @@
-//! Trim: cut a time range, fast or accurate (spec section 4).
+//! Trim: cut timeline clips, fast or accurate (§10 timeline rebuild).
 //!
-//! Exposes the `-ss` before/after `-i` distinction as a two-option toggle:
-//! before is fast input seeking (keyframe-aligned with stream copy) while
-//! after is frame-accurate but slower (requires re-encode). The preview
-//! shows exactly which flag ordering each choice produces — the kind of trap
-//! this tool exists to defuse.
+//! Ranges come from the visual timeline as [`ClipRange`]s, not text fields:
+//! `-ss` before `-i` is fast input seeking (keyframe-aligned with stream
+//! copy) while `-ss` after is frame-accurate but slower (requires
+//! re-encode). One clip trims directly to the output; several clips each
+//! trim to an intermediate and join through the shared concat-demuxer code
+//! (§11 reuse, not duplication). The preview shows the full sequence.
 
 use anyhow::{Context, Result};
 use tui_input::Input;
 
 use crate::ffmpeg::builder::{
     default_output_name, even_dims_filter, input_extension, push_globals, resolve_output,
-    safe_path_arg, CommandSpec,
+    safe_path_arg, CommandSpec, ConcatListFile,
 };
+use crate::ops::concat::{concat_list_path, demuxer_args, filter_args};
 use crate::ops::fields::{
-    default_selected, gate_by_capability, BuildContext, Field, FieldContext, FieldKind,
+    default_selected, gate_by_capability, BuildContext, ClipRange, Field, FieldContext, FieldKind,
     SelectOption,
 };
 use crate::ops::{InputKind, Operation};
@@ -28,7 +30,7 @@ impl TrimOp {
     pub const META: crate::ops::OperationMeta = crate::ops::OperationMeta {
         id: "trim",
         name: "Trim",
-        description: "Cut a time range: fast keyframe cut or accurate re-encode",
+        description: "Cut timeline clips: fast keyframe cuts or accurate re-encode",
         accepts: InputKind::AudioOrVideo,
     };
 }
@@ -48,7 +50,7 @@ impl Operation for TrimOp {
     }
 
     fn description(&self) -> &'static str {
-        "Cut a time range: fast keyframe cut or accurate re-encode"
+        "Cut timeline clips: fast keyframe cuts or accurate re-encode"
     }
 
     fn accepts(&self) -> InputKind {
@@ -88,22 +90,6 @@ impl Operation for TrimOp {
 
         vec![
             Field {
-                id: "start",
-                label: "Start".into(),
-                kind: FieldKind::Text {
-                    value: Input::new("00:00:00".to_string()),
-                },
-                explanation: "Where the cut begins (HH:MM:SS or seconds). Empty means the very start.".into(),
-            },
-            Field {
-                id: "end",
-                label: "End".into(),
-                kind: FieldKind::Text {
-                    value: Input::new(String::new()),
-                },
-                explanation: "Where the cut ends (HH:MM:SS or seconds). Empty means the end of the file.".into(),
-            },
-            Field {
                 id: "mode",
                 label: "Seek mode".into(),
                 kind: FieldKind::Toggle {
@@ -113,7 +99,7 @@ impl Operation for TrimOp {
                     ],
                     selected: MODE_FAST,
                 },
-                explanation: "Fast puts -ss before -i: instant seeking, but with stream copy the cut lands on the nearest keyframe. Accurate puts -ss after -i: frame-exact, but the video is re-encoded. Watch the flag order change in the preview.".into(),
+                explanation: "Applies to every clip. Fast puts -ss before -i: instant seeking, but with stream copy cuts land on the nearest keyframe. Accurate puts -ss after -i: frame-exact, but the video is re-encoded. Watch the flag order change in the preview.".into(),
             },
             Field {
                 id: "video_codec",
@@ -164,115 +150,207 @@ impl Operation for TrimOp {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "ffmpeg".to_string());
 
-        let start = ctx.get_str("start", "");
-        let start = normalize_timestamp(&start);
-        let end = ctx.get_str("end", "");
-        let end = normalize_timestamp(&end);
-        let accurate = ctx.get_toggle("mode", MODE_FAST) == MODE_ACCURATE;
-
-        let mut spec = CommandSpec::new(program);
-        push_globals(&mut spec, true);
-
-        if !accurate {
-            // Fast: -ss before -i seeks at the input (keyframe-aligned);
-            // -c copy keeps it instant and lossless.
-            if let Some(start) = start.as_deref() {
-                spec.flag_value(
-                    "-ss",
-                    start,
-                    "Seek before the input: fast, jumps to the nearest keyframe.",
-                );
+        if ctx.clips.is_empty() {
+            return Err(anyhow::anyhow!(
+                "define at least one clip on the timeline (n creates one)"
+            ));
+        }
+        // Output order follows timeline position, not creation order.
+        let mut clips = ctx.clips.clone();
+        clips.sort_by(|a, b| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for clip in &clips {
+            if !(0.0 <= clip.start && clip.start < clip.end) {
+                return Err(anyhow::anyhow!(
+                    "clip {}–{} is invalid: start must be before end",
+                    format_timestamp(clip.start),
+                    format_timestamp(clip.end)
+                ));
             }
-            spec.arg("-i");
-            spec.arg(safe_path_arg(input));
-            if let Some(end) = end.as_deref() {
-                spec.flag_value(
-                    "-to",
-                    end,
-                    "Stop writing when the output reaches this timestamp.",
-                );
-            }
-            spec.flag_value(
-                "-c",
-                "copy",
-                "Stream copy: no re-encode, so cuts stay keyframe-aligned.",
-            );
-        } else {
-            // Accurate: -ss after -i decodes up to the timestamp (slow but
-            // frame-exact) and the video is re-encoded.
-            spec.arg("-i");
-            spec.arg(safe_path_arg(input));
-            if let Some(start) = start.as_deref() {
-                spec.flag_value(
-                    "-ss",
-                    start,
-                    "Seek after the input: decodes everything up to the timestamp, so the cut is frame-accurate.",
-                );
-            }
-            if let Some(end) = end.as_deref() {
-                spec.flag_value(
-                    "-to",
-                    end,
-                    "Stop writing when the output reaches this timestamp.",
-                );
-            }
-            let vcodec = ctx.get_str("video_codec", "libx264");
-            if let Some(even) = even_dims_filter(ctx.probe) {
-                spec.flag_value(
-                    "-vf",
-                    format!("scale={even}"),
-                    "Odd-sized source, which these encoders refuse — shave one pixel edge to even dimensions.",
-                );
-            }
-            spec.flag_value(
-                "-c:v",
-                vcodec.clone(),
-                format!("Re-encode the cut with {vcodec} for frame accuracy."),
-            );
-            spec.flag_value(
-                "-crf",
-                ctx.get_int("crf", 23).to_string(),
-                "Quality level for the re-encoded cut.",
-            );
-            spec.flag_value("-c:a", "aac", "Re-encode the audio to stay in sync.");
         }
 
+        let accurate = ctx.get_toggle("mode", MODE_FAST) == MODE_ACCURATE;
+        let vcodec = ctx.get_str("video_codec", "libx264");
+        let crf = ctx.get_int("crf", 23);
         let ext = input_extension(input);
         let ext = if ext.is_empty() { "mp4" } else { &ext };
         let output = resolve_output(ctx.output, default_output_name(input, "trimmed", ext));
+
+        if clips.len() == 1 {
+            // N=1 is the same code path, straight to the final output.
+            return Ok(single_clip(
+                &program, input, &clips[0], accurate, &vcodec, crf, ctx.probe, &output,
+            ));
+        }
+
+        // N>1: one trim per clip into intermediates, then join.
+        // Accurate segments re-encode to exact timestamps, so the shared
+        // demuxer join is valid (verified: exact total). Fast segments are
+        // stream copies with ragged source timestamps that the demuxer
+        // stacks wrong (measured 7.4s for a 6s join), so they join through
+        // the re-encoding concat filter instead — the per-clip cuts stay
+        // keyframe-aligned, only the join re-encodes.
+        let stem = output
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "trimmed".to_string());
+        let clip_ext = output
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ext.to_string());
+        let mut intermediates = Vec::new();
+        let mut spec = CommandSpec::new(program.clone());
+        push_globals(&mut spec, true);
+        for (i, clip) in clips.iter().enumerate() {
+            let name = format!("{stem}_clip{i}.{clip_ext}", i = i + 1);
+            let intermediate = match output.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+                _ => std::path::PathBuf::from(name),
+            };
+            spec.pre_commands.push(single_clip(
+                &program,
+                input,
+                clip,
+                accurate,
+                &vcodec,
+                crf,
+                ctx.probe,
+                &intermediate,
+            ));
+            intermediates.push(intermediate);
+        }
+        if accurate {
+            let list_path = concat_list_path(&output);
+            spec.concat_list = Some(ConcatListFile {
+                path: list_path.clone(),
+                inputs: intermediates,
+            });
+            demuxer_args(
+                &mut spec,
+                &list_path,
+                &format!(
+                    "Join {} timeline clips in order — re-encoded to identical settings, so stream copy applies.",
+                    clips.len()
+                ),
+            );
+        } else {
+            filter_args(
+                &mut spec,
+                &intermediates,
+                &vcodec,
+                crf,
+                &format!(
+                    "Join {} timeline clips in order — the stream-copied segments keep ragged timestamps, so the join re-encodes to line them up.",
+                    clips.len()
+                ),
+            );
+        }
         spec.arg(safe_path_arg(&output));
         Ok(spec)
     }
 }
 
-/// Normalize a user-typed timestamp: empty or all-zero means "unset" (omit
-/// the flag); anything else passes through for ffmpeg to parse.
-fn normalize_timestamp(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
+/// One clip trim to `output`. The single shared implementation behind both
+/// the N=1 direct trim and every N>1 intermediate.
+#[allow(clippy::too_many_arguments)]
+fn single_clip(
+    program: &str,
+    input: &std::path::Path,
+    clip: &ClipRange,
+    accurate: bool,
+    vcodec: &str,
+    crf: i64,
+    probe: Option<&crate::ffmpeg::probe::ProbeResult>,
+    output: &std::path::Path,
+) -> CommandSpec {
+    let mut spec = CommandSpec::new(program);
+    push_globals(&mut spec, true);
+    let start = format_timestamp(clip.start);
+    let end = format_timestamp(clip.end);
+    if !accurate {
+        // Fast: -ss before -i seeks at the input (keyframe-aligned);
+        // `-t` takes the clip LENGTH — `-to` would count on the shifted
+        // output timeline and overshoot. -c copy keeps it instant.
+        if clip.start > 0.0 {
+            spec.flag_value(
+                "-ss",
+                start,
+                "Seek before the input: fast, jumps to the nearest keyframe.",
+            );
+        }
+        spec.arg("-i");
+        spec.arg(safe_path_arg(input));
+        spec.flag_value(
+            "-t",
+            format_timestamp(clip.len()),
+            "Keep this many seconds from the seek point (a duration, not a timestamp).",
+        );
+        spec.flag_value(
+            "-c",
+            "copy",
+            "Stream copy: no re-encode, so cuts stay keyframe-aligned.",
+        );
+    } else {
+        // Accurate: -ss after -i decodes up to the timestamp (slow but
+        // frame-exact) and the video is re-encoded.
+        spec.arg("-i");
+        spec.arg(safe_path_arg(input));
+        if clip.start > 0.0 {
+            spec.flag_value(
+                "-ss",
+                start,
+                "Seek after the input: decodes everything up to the timestamp, so the cut is frame-accurate.",
+            );
+        }
+        spec.flag_value(
+            "-to",
+            end,
+            "Stop writing when the output reaches this timestamp.",
+        );
+        if let Some(even) = even_dims_filter(probe) {
+            spec.flag_value(
+                "-vf",
+                format!("scale={even}"),
+                "Odd-sized source, which these encoders refuse — shave one pixel edge to even dimensions.",
+            );
+        }
+        spec.flag_value(
+            "-c:v",
+            vcodec,
+            format!("Re-encode the cut with {vcodec} for frame accuracy."),
+        );
+        spec.flag_value(
+            "-crf",
+            crf.to_string(),
+            "Quality level for the re-encoded cut.",
+        );
+        spec.flag_value("-c:a", "aac", "Re-encode the audio to stay in sync.");
     }
-    let is_zero = trimmed.chars().all(|c| c == '0' || c == ':' || c == '.');
-    if is_zero {
-        return None;
+    spec.arg(safe_path_arg(output));
+    spec
+}
+
+/// Format seconds for ffmpeg: whole seconds bare (`90`), fractions with
+/// milliseconds (`41.234`). Unambiguous, locale-independent.
+fn format_timestamp(secs: f64) -> String {
+    if secs.fract() == 0.0 {
+        format!("{}", secs as u64)
+    } else {
+        format!("{secs:.3}")
     }
-    Some(trimmed.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_timestamp;
+    use super::format_timestamp;
 
     #[test]
-    fn empty_and_zero_timestamps_are_unset() {
-        assert_eq!(normalize_timestamp(""), None);
-        assert_eq!(normalize_timestamp("  "), None);
-        assert_eq!(normalize_timestamp("00:00:00"), None);
-        assert_eq!(normalize_timestamp("0"), None);
-        assert_eq!(
-            normalize_timestamp("00:01:30"),
-            Some("00:01:30".to_string())
-        );
-        assert_eq!(normalize_timestamp("90"), Some("90".to_string()));
+    fn timestamps_format_unambiguously() {
+        assert_eq!(format_timestamp(90.0), "90");
+        assert_eq!(format_timestamp(0.0), "0");
+        assert_eq!(format_timestamp(41.234567), "41.235");
     }
 }

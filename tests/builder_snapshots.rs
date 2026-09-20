@@ -18,6 +18,7 @@ struct OwnedCtx {
     output: Option<PathBuf>,
     fields: HashMap<&'static str, FieldValue>,
     probes: Vec<ffkit::ffmpeg::probe::ProbeResult>,
+    clips: Vec<ffkit::ops::fields::ClipRange>,
 }
 
 impl OwnedCtx {
@@ -27,7 +28,17 @@ impl OwnedCtx {
             output: output.map(PathBuf::from),
             fields: fields.iter().cloned().collect(),
             probes: Vec::new(),
+            clips: Vec::new(),
         }
+    }
+
+    /// Attach timeline clips for trim builds.
+    fn with_clips(mut self, clips: Vec<(f64, f64)>) -> Self {
+        self.clips = clips
+            .into_iter()
+            .map(|(start, end)| ffkit::ops::fields::ClipRange { start, end })
+            .collect();
+        self
     }
 
     fn view(&self) -> BuildContext<'_> {
@@ -36,6 +47,7 @@ impl OwnedCtx {
             output: self.output.as_ref(),
             probe: None,
             input_probes: self.probes.clone(),
+            clips: self.clips.clone(),
             caps: None,
             fields: self.fields.clone(),
         }
@@ -194,6 +206,7 @@ fn compress_hostile_filenames_stay_single_argv_elements() {
 
 /// Fast mode seeks before `-i` with stream copy; accurate mode seeks after
 /// `-i` with a re-encode. The flag *ordering* is the feature under test.
+/// Ranges arrive as timeline clips (§10).
 #[test]
 fn trim_fast_seeks_before_input() {
     let op = operation_for("trim").expect("trim exists");
@@ -201,13 +214,12 @@ fn trim_fast_seeks_before_input() {
         &["input.mp4"],
         Some("clip.mp4"),
         &[
-            ("start", text("00:01:00")),
-            ("end", text("00:02:00")),
             ("mode", FieldValue::Toggle(0)),
             ("video_codec", text("libx264")),
             ("crf", FieldValue::Int(23)),
         ],
-    );
+    )
+    .with_clips(vec![(60.0, 120.0)]);
     let spec = op.build(&owned.view()).expect("build succeeds");
     assert_eq!(
         spec.args,
@@ -218,11 +230,11 @@ fn trim_fast_seeks_before_input() {
             "pipe:1",
             "-nostats",
             "-ss",
-            "00:01:00",
+            "60",
             "-i",
             "input.mp4",
-            "-to",
-            "00:02:00",
+            "-t",
+            "60",
             "-c",
             "copy",
             "clip.mp4",
@@ -237,13 +249,12 @@ fn trim_accurate_seeks_after_input_with_reencode() {
         &["input.mp4"],
         Some("clip.mp4"),
         &[
-            ("start", text("60")),
-            ("end", text("")),
             ("mode", FieldValue::Toggle(1)),
             ("video_codec", text("libx264")),
             ("crf", FieldValue::Int(20)),
         ],
-    );
+    )
+    .with_clips(vec![(60.0, 120.0)]);
     let spec = op.build(&owned.view()).expect("build succeeds");
     assert_eq!(
         spec.args,
@@ -257,6 +268,8 @@ fn trim_accurate_seeks_after_input_with_reencode() {
             "input.mp4",
             "-ss",
             "60",
+            "-to",
+            "120",
             "-c:v",
             "libx264",
             "-crf",
@@ -266,6 +279,69 @@ fn trim_accurate_seeks_after_input_with_reencode() {
             "clip.mp4",
         ]
     );
+}
+
+/// §10: two fast clips trim to intermediates and join through the
+/// re-encoding filter (stream-copied segments keep ragged timestamps the
+/// demuxer stacks wrong) — in timeline order.
+#[test]
+fn trim_two_clips_join_in_timeline_order() {
+    let op = operation_for("trim").expect("trim exists");
+    let owned = OwnedCtx::new(
+        &["input.mp4"],
+        Some("joined.mp4"),
+        &[
+            ("mode", FieldValue::Toggle(0)),
+            ("video_codec", text("libx264")),
+            ("crf", FieldValue::Int(23)),
+        ],
+    )
+    // Created out of order on purpose: output follows timeline position.
+    .with_clips(vec![(110.0, 135.0), (3.0, 41.0)]);
+    let spec = op.build(&owned.view()).expect("build succeeds");
+    assert_eq!(spec.pre_commands.len(), 2);
+    // First pre-command is the earliest clip (3–41), not creation order.
+    assert!(spec.pre_commands[0].args.contains(&"3".to_string()));
+    assert!(spec.pre_commands[1].args.contains(&"110".to_string()));
+    // Fast join re-encodes (filter), it does not demuxer-copy.
+    assert!(spec.concat_list.is_none());
+    assert!(spec.args.iter().any(|a| a.contains("concat=n=2")));
+    assert_eq!(spec.args.last().map(String::as_str), Some("joined.mp4"));
+}
+
+/// §10: two accurate clips join through the demuxer (re-encoded segments
+/// carry exact timestamps, verified live at 6.02s for 3+3).
+#[test]
+fn trim_two_accurate_clips_join_via_demuxer() {
+    let op = operation_for("trim").expect("trim exists");
+    let owned = OwnedCtx::new(
+        &["input.mp4"],
+        Some("joined.mp4"),
+        &[
+            ("mode", FieldValue::Toggle(1)),
+            ("video_codec", text("libx264")),
+            ("crf", FieldValue::Int(23)),
+        ],
+    )
+    .with_clips(vec![(3.0, 41.0), (110.0, 135.0)]);
+    let spec = op.build(&owned.view()).expect("build succeeds");
+    assert_eq!(spec.pre_commands.len(), 2);
+    assert!(spec.concat_list.is_some());
+    assert!(spec.args.contains(&"-c".to_string()));
+    assert!(spec.args.contains(&"copy".to_string()));
+}
+
+/// §10: no clips is a loud error, not an empty command.
+#[test]
+fn trim_without_clips_fails_loudly() {
+    let op = operation_for("trim").expect("trim exists");
+    let owned = OwnedCtx::new(
+        &["input.mp4"],
+        Some("clip.mp4"),
+        &[("mode", FieldValue::Toggle(0))],
+    );
+    op.build(&owned.view())
+        .expect_err("empty clips must fail loudly");
 }
 
 #[test]

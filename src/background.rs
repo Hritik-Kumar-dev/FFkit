@@ -58,6 +58,14 @@ pub enum BackgroundMsg {
         /// How it ended.
         result: JobResult,
     },
+    /// A trim filmstrip extraction finished: thumbnails oldest-first, or
+    /// the reason it failed (timeline degrades to ticks).
+    FilmstripReady {
+        /// The input the strip belongs to.
+        input: PathBuf,
+        /// Thumbnail files in timeline order, or the failure reason.
+        frames: Result<Vec<PathBuf>, String>,
+    },
 }
 
 /// Channel endpoints shared between the main loop and spawned tasks.
@@ -129,4 +137,80 @@ pub fn spawn_probe(tx: UnboundedSender<BackgroundMsg>, ffprobe: Option<PathBuf>,
         let result = probe::probe_file(&ffprobe, &path, PROBE_TIMEOUT).await;
         let _ = tx.send(BackgroundMsg::ProbeReady { path, result });
     });
+}
+
+/// Thumbnails per filmstrip and the extraction timeout.
+pub const STRIP_FRAMES: u32 = 24;
+/// Generous: thumbnail extraction is I/O on potentially huge files.
+pub const STRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Spawn trim filmstrip extraction: one ffmpeg run emitting [`STRIP_FRAMES`]
+/// evenly spaced thumbnails (`fps=N/D` over the known duration). Result
+/// arrives as [`BackgroundMsg::FilmstripReady`]; failures degrade the
+/// timeline to ticks, never an error screen.
+pub fn spawn_filmstrip(
+    tx: UnboundedSender<BackgroundMsg>,
+    ffmpeg: PathBuf,
+    input: PathBuf,
+    duration_secs: f64,
+) {
+    tokio::spawn(async move {
+        let result = extract_strip(&ffmpeg, &input, duration_secs).await;
+        let _ = tx.send(BackgroundMsg::FilmstripReady {
+            input,
+            frames: result,
+        });
+    });
+}
+
+/// Run the extraction synchronously (in its spawned task): small JPEGs in
+/// a fresh temp dir, oldest-first. Errors name the cause for the timeline
+/// fallback note.
+async fn extract_strip(
+    ffmpeg: &std::path::Path,
+    input: &PathBuf,
+    duration_secs: f64,
+) -> Result<Vec<PathBuf>, String> {
+    let dir = std::env::temp_dir().join(format!("ffkit-strip-{}", std::process::id()));
+    // Fresh dir per extraction run (stale frames would desync the strip).
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("cannot create strip dir: {e}"))?;
+    let fps = if duration_secs > 0.0 {
+        format!("{}", STRIP_FRAMES as f64 / duration_secs)
+    } else {
+        "1".to_string()
+    };
+    let pattern = dir.join("thumb_%03d.jpg");
+    let timed = tokio::time::timeout(
+        STRIP_TIMEOUT,
+        tokio::process::Command::new(ffmpeg)
+            .args(["-hide_banner", "-y", "-v", "error", "-i"])
+            .arg(input)
+            .args(["-vf", &format!("fps={fps},scale=320:-1"), "-q:v", "5"])
+            .arg(&pattern)
+            .output(),
+    )
+    .await;
+    let output = match timed {
+        Err(_) => return Err("thumbnail extraction timed out".to_string()),
+        Ok(Err(e)) => return Err(format!("cannot start ffmpeg: {e}")),
+        Ok(Ok(output)) => output,
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg strip failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut frames: Vec<PathBuf> = (1..=STRIP_FRAMES)
+        .map(|i| dir.join(format!("thumb_{i:03}.jpg")))
+        .filter(|p| p.exists())
+        .collect();
+    frames.sort();
+    if frames.is_empty() {
+        return Err("ffmpeg produced no thumbnails".to_string());
+    }
+    Ok(frames)
 }

@@ -64,7 +64,10 @@ async fn main() -> Result<()> {
     spawn_capability_detection(channel.tx.clone(), settings.clone());
 
     let mut terminal = init_terminal().context("initializing terminal")?;
-    let app = App::new(channel.tx, channel.rx, settings);
+    let mut app = App::new(channel.tx, channel.rx, settings);
+    // Terminal image support is pure environment sniffing (instant) and
+    // belongs with the ffmpeg capability check at startup.
+    app.image_backend = ffkit::ui::images::detect();
     let result = run_app(&mut terminal, app);
     restore_terminal()?;
     result
@@ -72,10 +75,18 @@ async fn main() -> Result<()> {
 
 /// The main loop. Everything else is a shell around this.
 fn run_app(terminal: &mut Tui, mut app: App) -> Result<()> {
+    use std::io::Write as _;
     loop {
         terminal
             .draw(|frame| app.render(frame))
             .context("rendering TUI frame")?;
+        // Inline-image payloads staged during render print after the draw
+        // (Kitty/iTerm2 filmstrip overlay); nothing is staged on other
+        // backends, so this is a no-op almost everywhere.
+        for payload in app.take_image_payloads() {
+            write!(std::io::stdout(), "{payload}").context("printing image payload")?;
+        }
+        let _ = std::io::stdout().flush();
 
         // Drain background work (capability reports, probe results) before
         // handling input so the UI reflects finished tasks immediately.
@@ -84,7 +95,7 @@ fn run_app(terminal: &mut Tui, mut app: App) -> Result<()> {
         match poll_event(TICK_RATE).context("polling terminal events")? {
             Some(AppEvent::Tick) => app.on_tick(),
             Some(AppEvent::Key(key)) => app.on_key(key),
-            Some(AppEvent::Resize) => {} // next draw picks up the new size
+            Some(AppEvent::Resize) => app.on_resize(),
             None => {}
         }
 

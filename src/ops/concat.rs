@@ -132,60 +132,97 @@ impl Operation for ConcatOp {
         let mut spec = CommandSpec::new(program);
         push_globals(&mut spec, true);
         if demuxer {
-            let list_path = std::env::temp_dir().join(format!(
-                "ffkit-concat-{}.txt",
-                output
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "join".to_string())
-            ));
+            let list_path = concat_list_path(&output);
             spec.concat_list = Some(ConcatListFile {
                 path: list_path.clone(),
                 inputs: ctx.inputs.to_vec(),
             });
-            spec.arg("-f");
-            spec.arg("concat");
-            spec.arg("-safe");
-            spec.arg("0");
-            spec.arg("-i");
-            spec.arg(safe_path_arg(&list_path));
-            spec.flag_value(
-                "-c",
-                "copy",
-                format!(
+            demuxer_args(
+                &mut spec,
+                &list_path,
+                &format!(
                     "Stream copy through the concat demuxer — {}.",
                     demuxer_reason(&ctx.input_probes, method == "demuxer")
                 ),
             );
         } else {
-            let (filter, has_video, has_audio) = concat_filter(ctx)?;
-            for input in ctx.inputs {
-                spec.arg("-i");
-                spec.arg(safe_path_arg(input));
+            let (has_video, has_audio) = concat_stream_kinds(ctx)?;
+            if !(has_video && has_audio) {
+                return Err(anyhow::anyhow!(
+                    "the concat filter here needs video+audio in every input — mixed inputs need normalizing first"
+                ));
             }
-            spec.flag_value(
-                "-filter_complex",
-                filter,
-                format!(
+            filter_args(
+                &mut spec,
+                ctx.inputs,
+                "libx264",
+                23,
+                &format!(
                     "Concat filter: re-encode to normalize inputs. {}",
                     filter_reason(ctx)
                 ),
             );
-            if has_video {
-                spec.arg("-map");
-                spec.arg("[outv]");
-                spec.flag_value("-c:v", "libx264", "Re-encoded join video.");
-                spec.flag_value("-crf", "23", "Quality for the joined video.");
-            }
-            if has_audio {
-                spec.arg("-map");
-                spec.arg("[outa]");
-                spec.flag_value("-c:a", "aac", "Re-encoded join audio.");
-            }
         }
         spec.arg(safe_path_arg(&output));
         Ok(spec)
     }
+}
+
+/// List-file path for a demuxer join producing `output`. Shared with the
+/// multi-clip trim builder (§10) — same mechanism, same cleanup.
+pub(crate) fn concat_list_path(output: &std::path::Path) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "ffkit-concat-{}.txt",
+        output
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "join".to_string())
+    ))
+}
+
+/// Append a demuxer join (`-f concat -safe 0 -i <list> -c copy`) to `spec`.
+/// Shared with the multi-clip trim builder (§10) so both joins stay
+/// byte-identical instead of drifting apart.
+pub(crate) fn demuxer_args(spec: &mut CommandSpec, list_path: &std::path::Path, reason: &str) {
+    spec.arg("-f");
+    spec.arg("concat");
+    spec.arg("-safe");
+    spec.arg("0");
+    spec.arg("-i");
+    spec.arg(safe_path_arg(list_path));
+    spec.flag_value("-c", "copy", reason.to_string());
+}
+
+/// Append a filter join (`-filter_complex concat + maps + re-encode`) to
+/// `spec` for `inputs` that all carry video and audio. Shared with the
+/// fast multi-clip trim join (§10): stream-copied segments keep ragged
+/// source timestamps, so only a re-encoding join lines them up — the
+/// demuxer demonstrably stacks them wrong (measured 7.4s for a 6s join).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filter_args(
+    spec: &mut CommandSpec,
+    inputs: &[std::path::PathBuf],
+    vcodec: &str,
+    crf: i64,
+    reason: &str,
+) {
+    let mut filter = String::new();
+    for i in 0..inputs.len() {
+        filter.push_str(&format!("[{i}:v][{i}:a]"));
+    }
+    filter.push_str(&format!("concat=n={}:v=1:a=1[outv][outa]", inputs.len()));
+    for input in inputs {
+        spec.arg("-i");
+        spec.arg(safe_path_arg(input));
+    }
+    spec.flag_value("-filter_complex", filter, reason.to_string());
+    spec.arg("-map");
+    spec.arg("[outv]");
+    spec.flag_value("-c:v", vcodec, format!("Re-encoded join video ({vcodec})."));
+    spec.flag_value("-crf", crf.to_string(), "Quality for the joined video.");
+    spec.arg("-map");
+    spec.arg("[outa]");
+    spec.flag_value("-c:a", "aac", "Re-encoded join audio.");
 }
 
 /// True when every probed input shares codec, audio, and dimensions.
@@ -223,10 +260,10 @@ fn filter_reason(ctx: &BuildContext) -> String {
     "Inputs differ in codec, size, or audio — the demuxer would refuse them.".to_string()
 }
 
-/// Build the concat filter expression plus whether it carries video/audio.
-/// Mixed stream types (some inputs video, some audio-only) are a loud error:
+/// Whether the inputs carry video/audio, from probes when complete.
+// Mixed stream types (some inputs video, some audio-only) are a loud error:
 // the filter needs matching segments.
-fn concat_filter(ctx: &BuildContext) -> Result<(String, bool, bool)> {
+fn concat_stream_kinds(ctx: &BuildContext) -> Result<(bool, bool)> {
     let complete = ctx.input_probes.len() == ctx.inputs.len();
     let mut kinds = Vec::new();
     for i in 0..ctx.inputs.len() {
@@ -248,20 +285,5 @@ fn concat_filter(ctx: &BuildContext) -> Result<(String, bool, bool)> {
             "inputs mix different stream types (some with video/audio, some without) — normalize them first (e.g. convert each to MP4), then join"
         ));
     }
-    let mut filter = String::new();
-    for (i, (has_video, has_audio)) in kinds.iter().enumerate() {
-        if *has_video {
-            filter.push_str(&format!("[{i}:v]"));
-        }
-        if *has_audio {
-            filter.push_str(&format!("[{i}:a]"));
-        }
-    }
-    filter.push_str(&format!(
-        "concat=n={}:v={}:a={}[outv][outa]",
-        ctx.inputs.len(),
-        u8::from(has_video),
-        u8::from(has_audio)
-    ));
-    Ok((filter, has_video, has_audio))
+    Ok((has_video, has_audio))
 }

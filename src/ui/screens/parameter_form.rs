@@ -110,6 +110,8 @@ impl ParamForm {
             output: output.as_ref(),
             probe,
             input_probes,
+            // Generic forms never own clips; trim uses its own screen.
+            clips: Vec::new(),
             caps,
             fields: collect_values(&self.fields),
         };
@@ -200,42 +202,16 @@ impl ParamForm {
     /// replaces the whole value and Backspace/Delete clears it; any other
     /// key drops the selection and behaves normally.
     fn on_key_editing(&mut self, key: KeyEvent) -> FormAction {
-        match key.code {
-            KeyCode::Enter | KeyCode::Esc => {
-                self.editing = false;
-                self.edit_select_all = false;
-            }
-            KeyCode::Char(c) if self.edit_select_all && key.modifiers.is_empty() => {
-                if let Some(field) = self.fields.get_mut(self.focus) {
-                    if let FieldKind::Text { value } = &mut field.kind {
-                        *value = tui_input::Input::new(c.to_string());
-                        self.edit_select_all = false;
-                        return FormAction::Changed;
-                    }
-                }
-                self.edit_select_all = false;
-            }
-            KeyCode::Backspace | KeyCode::Delete if self.edit_select_all => {
-                if let Some(field) = self.fields.get_mut(self.focus) {
-                    if let FieldKind::Text { value } = &mut field.kind {
-                        *value = tui_input::Input::default();
-                        self.edit_select_all = false;
-                        return FormAction::Changed;
-                    }
-                }
-                self.edit_select_all = false;
-            }
-            _ => {
-                self.edit_select_all = false;
-                if let Some(field) = self.fields.get_mut(self.focus) {
-                    if let FieldKind::Text { value } = &mut field.kind {
-                        value.handle_event(&crossterm::event::Event::Key(key));
-                        return FormAction::Changed;
-                    }
-                }
-            }
+        let Some(field) = self.fields.get_mut(self.focus) else {
+            self.editing = false;
+            self.edit_select_all = false;
+            return FormAction::None;
+        };
+        if handle_text_edit(field, &mut self.editing, &mut self.edit_select_all, key) {
+            FormAction::Changed
+        } else {
+            FormAction::None
         }
-        FormAction::None
     }
 
     /// Currently focused field, if any.
@@ -244,10 +220,55 @@ impl ParamForm {
     }
 }
 
+/// Shared text-editing keys for form text fields (parameter form and trim
+/// timeline). Enter/Esc leave edit mode; select-all replaces on first
+/// type. Returns true when the value changed (caller rebuilds the preview).
+pub(crate) fn handle_text_edit(
+    field: &mut Field,
+    editing: &mut bool,
+    select_all: &mut bool,
+    key: KeyEvent,
+) -> bool {
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => {
+            *editing = false;
+            *select_all = false;
+            false
+        }
+        KeyCode::Char(c) if *select_all && key.modifiers.is_empty() => {
+            if let FieldKind::Text { value } = &mut field.kind {
+                *value = tui_input::Input::new(c.to_string());
+                *select_all = false;
+                return true;
+            }
+            *select_all = false;
+            false
+        }
+        KeyCode::Backspace | KeyCode::Delete if *select_all => {
+            if let FieldKind::Text { value } = &mut field.kind {
+                *value = tui_input::Input::default();
+                *select_all = false;
+                return true;
+            }
+            *select_all = false;
+            false
+        }
+        _ => {
+            *select_all = false;
+            if let FieldKind::Text { value } = &mut field.kind {
+                value.handle_event(&crossterm::event::Event::Key(key));
+                return true;
+            }
+            false
+        }
+    }
+}
+
 /// Find the first changed token between two argv vectors for highlighting.
 /// When a value changed, the flag and value highlight together (`-crf 20`)
-/// so the connection between control and flag is unmistakable.
-fn diff_token(old: &[String], new: &[String]) -> Option<String> {
+/// so the control→flag connection is unmistakable. Shared with the trim
+/// timeline preview.
+pub(crate) fn diff_token(old: &[String], new: &[String]) -> Option<String> {
     let len = old.len().min(new.len());
     let mut index = old.len().min(new.len());
     for (i, (a, b)) in old.iter().zip(new.iter()).take(len).enumerate() {
@@ -338,38 +359,8 @@ fn render_fields(frame: &mut Frame, area: Rect, form: &ParamForm, theme: &Theme)
     }
     for (i, field) in form.fields.iter().enumerate() {
         let focused = i == form.focus && !form.focus_cmd;
-        let marker = if focused { "▸ " } else { "  " };
-        let label = format!("{marker}{}", field.label);
         let select_all = focused && form.editing && form.edit_select_all;
-        let control = render_control(field, focused, select_all, theme);
-        let mut spans = vec![Span::styled(label, label_style(focused, theme))];
-        spans.push(Span::raw("  "));
-        spans.extend(control);
-        lines.push(Line::from(spans));
-        // Slider caption + landmarks under the focused slider.
-        if let FieldKind::Slider {
-            caption, landmarks, ..
-        } = &field.kind
-        {
-            if focused {
-                if let Some(caption) = caption {
-                    lines.push(Line::from(vec![
-                        Span::raw("      "),
-                        Span::styled(caption.clone(), theme.footer()),
-                    ]));
-                }
-                if !landmarks.is_empty() {
-                    let marks: Vec<String> = landmarks
-                        .iter()
-                        .map(|(v, label)| format!("{v} {label}"))
-                        .collect();
-                    lines.push(Line::from(vec![
-                        Span::raw("      "),
-                        Span::styled(marks.join(" · "), theme.footer()),
-                    ]));
-                }
-            }
-        }
+        lines.extend(field_lines(field, focused, select_all, theme));
     }
     let block = Block::default().borders(Borders::ALL).title("Parameters");
     let block = if form.focus_cmd {
@@ -380,6 +371,50 @@ fn render_fields(frame: &mut Frame, area: Rect, form: &ParamForm, theme: &Theme)
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// One field's rendered lines: label + control row, plus slider caption
+/// and landmarks under a focused slider. Shared with the trim timeline
+/// screen so both forms paint identically.
+pub(crate) fn field_lines(
+    field: &Field,
+    focused: bool,
+    select_all: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let marker = if focused { "▸ " } else { "  " };
+    let label = format!("{marker}{}", field.label);
+    let control = render_control(field, focused, select_all, theme);
+    let mut spans = vec![Span::styled(label, label_style(focused, theme))];
+    spans.push(Span::raw("  "));
+    spans.extend(control);
+    lines.push(Line::from(spans));
+    // Slider caption + landmarks under the focused slider.
+    if let FieldKind::Slider {
+        caption, landmarks, ..
+    } = &field.kind
+    {
+        if focused {
+            if let Some(caption) = caption {
+                lines.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(caption.clone(), theme.footer()),
+                ]));
+            }
+            if !landmarks.is_empty() {
+                let marks: Vec<String> = landmarks
+                    .iter()
+                    .map(|(v, label)| format!("{v} {label}"))
+                    .collect();
+                lines.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(marks.join(" · "), theme.footer()),
+                ]));
+            }
+        }
+    }
+    lines
+}
+/// warnings, and the multi-file note. Carries the M2 panel into the M3 form.
 /// Media-info pane for the confirmed input(s): probe summaries, rotation
 /// warnings, and the multi-file note. Carries the M2 panel into the M3 form.
 fn render_info(frame: &mut Frame, area: Rect, app: &crate::app::App, theme: &Theme) {
@@ -524,27 +559,61 @@ fn render_control(
 /// Command preview pane: wrapped shell-quoted command with the just-changed
 /// token highlighted, plus the focused field's flag explanation.
 fn render_command(frame: &mut Frame, area: Rect, form: &ParamForm, theme: &Theme) {
+    let highlight = form
+        .changed
+        .as_ref()
+        .filter(|(_, at)| at.elapsed().as_millis() < HIGHLIGHT_MS)
+        .map(|(token, _)| token.as_str());
+    let explanation = form
+        .focused()
+        .map(|field| (field.label.as_str(), field.explanation.as_str()));
+    render_spec_preview(
+        frame,
+        area,
+        "Command — [c] copy",
+        form.preview.as_ref(),
+        form.build_error.as_deref(),
+        highlight,
+        form.focus_cmd,
+        form.cmd_scroll,
+        explanation,
+        theme,
+    );
+}
+
+/// Shared live-preview pane: wrapped shell-quoted command with the
+/// just-changed token highlighted, an optional scrolled view, and the
+/// focused control's flag explanation. Used by the parameter form and the
+/// trim timeline so both previews paint identically.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_spec_preview(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    preview: Option<&CommandSpec>,
+    build_error: Option<&str>,
+    highlight: Option<&str>,
+    focused: bool,
+    scroll: usize,
+    explanation: Option<(&str, &str)>,
+    theme: &Theme,
+) {
     let mut lines: Vec<Line> = Vec::new();
-    match form.preview.as_ref() {
+    match preview {
         None => {
-            let message = form
-                .build_error
-                .clone()
-                .unwrap_or_else(|| "No command built yet.".to_string());
-            lines.push(Line::from(Span::styled(message, theme.warning_style())));
+            let message = build_error.unwrap_or("No command built yet.");
+            lines.push(Line::from(Span::styled(
+                message.to_string(),
+                theme.warning_style(),
+            )));
         }
         Some(spec) => {
             let display = spec.to_display();
-            let highlight = form
-                .changed
-                .as_ref()
-                .filter(|(_, at)| at.elapsed().as_millis() < HIGHLIGHT_MS)
-                .map(|(token, _)| token.clone());
-            let styled = styled_display(&display, highlight.as_deref(), theme);
+            let styled = styled_display(&display, highlight, theme);
             let total = styled.len();
             let visible = (area.height.saturating_sub(2)) as usize;
             let max_scroll = total.saturating_sub(visible.max(1));
-            let start = form.cmd_scroll.min(max_scroll);
+            let start = scroll.min(max_scroll);
             lines.extend(styled.into_iter().skip(start).take(visible.max(1)));
             if total > visible.max(1) {
                 lines.push(Line::from(Span::styled(
@@ -557,18 +626,18 @@ fn render_command(frame: &mut Frame, area: Rect, form: &ParamForm, theme: &Theme
             }
         }
     }
-    // Contextual explanation for the focused field — the teaching mechanism.
-    if let Some(field) = form.focused() {
+    // Contextual explanation for the focused control — the teaching mechanism.
+    if let Some((label, text)) = explanation {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled(format!("{}  ", field.label), theme.title()),
-            Span::styled(field.explanation.clone(), theme.explanation_style()),
+            Span::styled(format!("{label}  "), theme.title()),
+            Span::styled(text.to_string(), theme.explanation_style()),
         ]));
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Command — [c] copy");
-    let block = if form.focus_cmd {
+        .title(title.to_string());
+    let block = if focused {
         block.border_style(theme.title())
     } else {
         block

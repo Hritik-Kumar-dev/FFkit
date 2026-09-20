@@ -23,6 +23,7 @@ use crate::ffmpeg::runner::{force_kill, spawn_job, JobRequest};
 use crate::ops::fields::{collect_values, Field, FieldValue};
 use crate::ops::{operation_for, OperationMeta, OPERATIONS};
 use crate::queue::{expand_template, Job, JobStatus, QueueState};
+use crate::ui::images::ImageBackend;
 use crate::ui::screens::parameter_form::ParamForm;
 use crate::ui::screens::popups::{NamePrompt, PresetPopup};
 use crate::ui::screens::running::{RunAction, RunPhase, RunState};
@@ -43,6 +44,8 @@ pub enum Screen {
     FileBrowser,
     /// Adjust parameters with live command preview (form widgets land in M3).
     ParameterForm,
+    /// Trim timeline: filmstrip, scrubbable multi-clip track (§10).
+    Trim,
     /// Watch a running ffmpeg job. Placeholder until M4.
     Running,
     /// Batch job queue; remembers where it was opened from.
@@ -86,6 +89,14 @@ pub struct App {
     pub form_inputs: Vec<PathBuf>,
     /// Live parameter form; `None` until inputs are confirmed.
     pub form: Option<ParamForm>,
+    /// Trim timeline state; `Some` while the trim screen is open.
+    pub trim: Option<crate::ui::screens::trim::TrimState>,
+    /// Terminal image backend for the filmstrip (detected at startup).
+    pub image_backend: ImageBackend,
+    /// Inline-image payloads waiting to print post-draw (Kitty/iTerm2).
+    pub pending_images: Vec<String>,
+    /// Strip rows currently painted by payloads (cleared on screen exit).
+    pub trim_images_shown: bool,
     /// Running job state; `None` until the user runs something.
     pub run: Option<RunState>,
     /// Batch queue (M6): enqueued jobs and execution state.
@@ -124,6 +135,10 @@ impl App {
             probes: HashMap::new(),
             form_inputs: Vec::new(),
             form: None,
+            trim: None,
+            image_backend: ImageBackend::Blocks,
+            pending_images: Vec::new(),
+            trim_images_shown: false,
             run: None,
             queue: QueueState::new(),
             pending_preset: None,
@@ -216,7 +231,13 @@ impl App {
                     Ok(probed) => ProbeState::Ready(probed),
                     Err(e) => ProbeState::Failed(probe_error_message(&e)),
                 };
-                self.probes.insert(path, state);
+                self.probes.insert(path.clone(), state);
+                // A landing probe can complete the trim timeline: duration
+                // unlocks the track, fps sizes fine steps, and the
+                // filmstrip can finally extract.
+                if self.trim.as_ref().is_some_and(|trim| trim.input == path) {
+                    self.refresh_trim_probe();
+                }
             }
             BackgroundMsg::JobStarted { job_id, pid } => {
                 if self.run.as_ref().is_some_and(|run| run.job_id == job_id) {
@@ -250,6 +271,21 @@ impl App {
                     }
                 } else {
                     self.finish_queue_job(job_id, result);
+                }
+            }
+            BackgroundMsg::FilmstripReady { input, frames } => {
+                let backend = self.image_backend;
+                if let Some(trim) = self.trim.as_mut() {
+                    if trim.input == input {
+                        match frames {
+                            Ok(frames) => trim.set_filmstrip(frames, backend),
+                            Err(reason) => {
+                                trim.strip_pending = false;
+                                trim.strip_error = Some(reason);
+                                trim.strip_dirty = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -341,7 +377,10 @@ impl App {
         // `Q` opens the queue from the setup screens (never while typing).
         if key.code == KeyCode::Char('Q') && !self.has_text_focus() {
             match &self.screen {
-                Screen::OperationPicker | Screen::FileBrowser | Screen::ParameterForm => {
+                Screen::OperationPicker
+                | Screen::FileBrowser
+                | Screen::ParameterForm
+                | Screen::Trim => {
                     self.screen = Screen::Queue {
                         return_to: Box::new(self.screen.clone()),
                     };
@@ -368,6 +407,7 @@ impl App {
             Screen::OperationPicker => self.on_key_picker(key),
             Screen::FileBrowser => self.on_key_browser(key),
             Screen::ParameterForm => self.on_key_form(key),
+            Screen::Trim => self.on_key_trim(key),
             Screen::Running => self.on_key_running(key),
             Screen::Help { .. } => {
                 // Any key closes the help overlay (Esc/? also work naturally).
@@ -427,8 +467,7 @@ impl App {
                     self.ensure_probe(input);
                 }
                 self.form_inputs = inputs;
-                self.open_form();
-                self.screen = Screen::ParameterForm;
+                self.open_form_or_trim();
                 self.status_message = None;
             }
         }
@@ -444,6 +483,18 @@ impl App {
             if entry.is_media {
                 self.ensure_probe(&entry.path.clone());
             }
+        }
+    }
+
+    /// Open the parameter form — or the trim timeline when trim is the
+    /// selected operation. Routes here from browser confirm.
+    fn open_form_or_trim(&mut self) {
+        if self.selected_operation_meta().id == "trim" {
+            self.open_trim();
+            self.screen = Screen::Trim;
+        } else {
+            self.open_form();
+            self.screen = Screen::ParameterForm;
         }
     }
 
@@ -485,6 +536,121 @@ impl App {
         self.rebuild_form();
     }
 
+    /// Open the trim timeline over the first confirmed input. Extra
+    /// selections are ignored with a note — one track, one file.
+    /// Applies config defaults, pending presets, and the output dir to the
+    /// timeline fields exactly like the parameter form, then builds.
+    fn open_trim(&mut self) {
+        let Some(input) = self.form_inputs.first().cloned() else {
+            self.status_message = Some("Nothing to trim.".to_string());
+            return;
+        };
+        if self.form_inputs.len() > 1 {
+            self.status_message =
+                Some("Trim edits the first file; extra selections are ignored.".to_string());
+        }
+        let Some(op) = operation_for("trim") else {
+            self.status_message = Some("Unknown operation: trim".to_string());
+            return;
+        };
+        let probe = self.probes.get(&input).and_then(|state| match state {
+            ProbeState::Ready(result) => Some(result.clone()),
+            ProbeState::Pending | ProbeState::Failed(_) => None,
+        });
+        let duration = probe
+            .as_ref()
+            .and_then(|p| p.duration)
+            .map(|d| d.as_secs_f64());
+        let fps = probe
+            .as_ref()
+            .and_then(|p| p.video_stream())
+            .and_then(|v| v.fps);
+        let mut fields = op.fields(&crate::ops::FieldContext {
+            probe: probe.as_ref(),
+            caps: self.caps.as_ref(),
+        });
+        apply_preset(&mut fields, &defaults_as_preset(&self.settings.defaults));
+        if let Some(preset) = self.pending_preset.take() {
+            apply_preset(&mut fields, &preset);
+            self.status_message = Some(format!("Preset '{}' applied.", preset.name));
+        }
+        rewrite_output_dir(&mut fields, &self.settings.general.default_output_dir);
+        let mut state =
+            crate::ui::screens::trim::TrimState::new(input.clone(), duration, fps, fields);
+        if let (Some(duration), Some(ffmpeg)) = (duration, self.ffmpeg_program()) {
+            crate::background::spawn_filmstrip(self.tx.clone(), ffmpeg, input, duration);
+            state.strip_pending = true;
+        }
+        self.trim = Some(state);
+        self.rebuild_trim();
+    }
+
+    /// Program for spawning ffmpeg, honoring the configured override.
+    fn ffmpeg_program(&self) -> Option<PathBuf> {
+        self.caps
+            .as_ref()
+            .and_then(|c| c.ffmpeg_path.clone())
+            .or_else(|| Some(PathBuf::from("ffmpeg")))
+    }
+
+    /// Re-run the trim builder from clips + field values.
+    fn rebuild_trim(&mut self) {
+        use crate::ui::screens::parameter_form::diff_token;
+
+        let Some(op) = operation_for("trim") else {
+            return;
+        };
+        let Some(trim) = self.trim.as_ref() else {
+            return;
+        };
+        let clips = trim.clips.clone();
+        let values = collect_values(&trim.fields);
+        let output = trim
+            .fields
+            .iter()
+            .find(|f| f.id == "output")
+            .map(|f| match f.value() {
+                FieldValue::Text(text) => PathBuf::from(text),
+                _ => PathBuf::from(""),
+            });
+        let inputs = vec![trim.input.clone()];
+        let probe = self.probes.get(&trim.input).and_then(|state| match state {
+            ProbeState::Ready(result) => Some(result.clone()),
+            ProbeState::Pending | ProbeState::Failed(_) => None,
+        });
+        let input_probes = probe.clone().into_iter().collect();
+        let ctx = crate::ops::BuildContext {
+            inputs: &inputs,
+            output: output.as_ref(),
+            probe: probe.as_ref(),
+            input_probes,
+            clips,
+            caps: self.caps.as_ref(),
+            fields: values,
+        };
+        let previous = self.trim.as_ref().and_then(|t| t.preview.clone());
+        match op.build(&ctx) {
+            Ok(spec) => {
+                let changed = previous
+                    .as_ref()
+                    .and_then(|prev| diff_token(&prev.args, &spec.args))
+                    .map(|token| (token, std::time::Instant::now()));
+                if let Some(trim) = self.trim.as_mut() {
+                    trim.preview = Some(spec);
+                    trim.build_error = None;
+                    trim.changed = changed;
+                    trim.cmd_scroll = 0;
+                }
+            }
+            Err(e) => {
+                if let Some(trim) = self.trim.as_mut() {
+                    trim.preview = None;
+                    trim.build_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
+
     /// Snapshot of one input's probe-driven build inputs for batch jobs.
     fn batch_probe(&self, input: &PathBuf) -> (Option<ProbeResult>, Vec<ProbeResult>) {
         let probe = self.probes.get(input).and_then(|state| match state {
@@ -503,6 +669,57 @@ impl App {
                 ProbeState::Ready(result) => Some(result),
                 ProbeState::Pending | ProbeState::Failed(_) => None,
             })
+    }
+
+    /// A landing probe can complete the trim timeline: duration unlocks
+    /// the track, fps sizes fine steps, a full clip appears when none
+    /// exists yet, and the filmstrip finally has something to extract.
+    fn refresh_trim_probe(&mut self) {
+        let probe = self.trim.as_ref().and_then(|trim| {
+            self.probes.get(&trim.input).and_then(|state| match state {
+                ProbeState::Ready(result) => Some(result.clone()),
+                ProbeState::Pending | ProbeState::Failed(_) => None,
+            })
+        });
+        let Some(probe) = probe else {
+            if self.trim.is_some() {
+                self.rebuild_trim();
+            }
+            return;
+        };
+        let duration = probe.duration.map(|d| d.as_secs_f64());
+        let fps = probe.video_stream().and_then(|v| v.fps);
+        let ffmpeg = self.ffmpeg_program();
+        if let Some(trim) = self.trim.as_mut() {
+            if trim.duration.is_none() {
+                trim.duration = duration;
+                trim.fps = fps;
+            }
+            if trim.clips.is_empty() {
+                if let Some(duration) = duration {
+                    if duration > 0.0 {
+                        trim.clips.push(crate::ops::fields::ClipRange {
+                            start: 0.0,
+                            end: duration,
+                        });
+                    }
+                }
+            }
+            if trim.filmstrip.is_empty() && !trim.strip_pending {
+                if let (Some(duration), Some(ffmpeg)) = (duration, ffmpeg) {
+                    if duration > 0.0 {
+                        crate::background::spawn_filmstrip(
+                            self.tx.clone(),
+                            ffmpeg,
+                            trim.input.clone(),
+                            duration,
+                        );
+                        trim.strip_pending = true;
+                    }
+                }
+            }
+        }
+        self.rebuild_trim();
     }
 
     /// Ready probes for all confirmed inputs in order, skipping pending
@@ -633,6 +850,19 @@ impl App {
                     .and_then(|input| std::fs::metadata(input).ok())
                     .map(|m| m.len())
             });
+        self.launch_spec(op_name, spec, output, total_duration, input_size);
+    }
+
+    /// Shared run entry: overwrite confirm (unless disabled) or immediate
+    /// spawn, then the running screen. Used by single, trim, and future flows.
+    fn launch_spec(
+        &mut self,
+        op_name: String,
+        spec: crate::ffmpeg::builder::CommandSpec,
+        output: PathBuf,
+        total_duration: Option<std::time::Duration>,
+        input_size: Option<u64>,
+    ) {
         if output.exists() && self.settings.general.confirm_overwrite {
             self.run = Some(RunState::confirming(op_name, &spec, output));
         } else {
@@ -681,6 +911,7 @@ impl App {
                 output: None,
                 probe: probe.as_ref(),
                 input_probes: input_probes.clone(),
+                clips: Vec::new(),
                 caps: self.caps.as_ref(),
                 fields: field_values.clone(),
             };
@@ -702,6 +933,7 @@ impl App {
                 output: Some(&output),
                 probe: probe.as_ref(),
                 input_probes,
+                clips: Vec::new(),
                 caps: self.caps.as_ref(),
                 fields: field_values.clone(),
             };
@@ -937,6 +1169,22 @@ impl App {
                     return;
                 }
                 let Some(form) = self.form.as_ref() else {
+                    // No parameter form — snapshot the trim timeline's
+                    // fields when that screen owns them.
+                    let Some(trim) = self.trim.as_ref() else {
+                        return;
+                    };
+                    let preset = preset_from_fields(name.clone(), "trim".to_string(), &trim.fields);
+                    self.settings.presets.push(preset);
+                    match self.settings.save() {
+                        Ok(()) => {
+                            self.status_message = Some(format!("Preset '{name}' saved."));
+                        }
+                        Err(e) => {
+                            self.status_message =
+                                Some(format!("Preset applied but not saved: {e:#}"));
+                        }
+                    }
                     return;
                 };
                 let preset = preset_from_fields(name.clone(), form.op_id.clone(), &form.fields);
@@ -1071,6 +1319,87 @@ impl App {
         }
     }
 
+    /// Keys on the trim timeline: `?` help, `c` copy, `s` save preset,
+    /// everything else to the timeline itself.
+    fn on_key_trim(&mut self, key: KeyEvent) {
+        let editing = self.trim.as_ref().is_some_and(|t| t.editing);
+        if key.code == KeyCode::Char('?') && !editing {
+            self.screen = Screen::Help {
+                return_to: Box::new(Screen::Trim),
+            };
+            return;
+        }
+        if key.code == KeyCode::Char('c') && !editing {
+            self.copy_trim_command();
+            return;
+        }
+        if key.code == KeyCode::Char('s') && !editing {
+            self.save_prompt = Some(NamePrompt::new("Save preset as"));
+            return;
+        }
+        let action = match self.trim.as_mut() {
+            Some(trim) => crate::ui::screens::trim::on_key(trim, key),
+            None => crate::ui::screens::trim::TrimAction::Back,
+        };
+        match action {
+            crate::ui::screens::trim::TrimAction::None => {}
+            crate::ui::screens::trim::TrimAction::Changed => self.rebuild_trim(),
+            crate::ui::screens::trim::TrimAction::Back => {
+                self.screen = Screen::FileBrowser;
+                self.status_message = None;
+            }
+            crate::ui::screens::trim::TrimAction::Run => self.start_trim_flow(),
+            crate::ui::screens::trim::TrimAction::Status(message) => {
+                self.status_message = Some(message);
+            }
+        }
+    }
+
+    /// Enter pressed on the trim timeline: run the live preview spec.
+    fn start_trim_flow(&mut self) {
+        if self.single_or_queue_busy() {
+            return;
+        }
+        let Some(trim) = self.trim.as_ref() else {
+            return;
+        };
+        let Some(spec) = trim.preview.clone() else {
+            self.status_message = Some("No command to run — define a clip first.".to_string());
+            return;
+        };
+        let output = spec
+            .output_path()
+            .unwrap_or_else(|| PathBuf::from("ffkit_output"));
+        let total = trim.duration.map(std::time::Duration::from_secs_f64);
+        let input_size = self
+            .probes
+            .get(&trim.input)
+            .and_then(|state| match state {
+                ProbeState::Ready(result) => Some(result.clone()),
+                ProbeState::Pending | ProbeState::Failed(_) => None,
+            })
+            .and_then(|p| p.size_bytes)
+            .or_else(|| std::fs::metadata(&trim.input).ok().map(|m| m.len()));
+        self.launch_spec("Trim".to_string(), spec, output, total, input_size);
+    }
+
+    /// Copy the trim preview command to the clipboard.
+    fn copy_trim_command(&mut self) {
+        let Some(display) = self
+            .trim
+            .as_ref()
+            .and_then(|trim| trim.preview.as_ref())
+            .map(|spec| spec.to_display())
+        else {
+            self.status_message = Some("Nothing to copy yet.".to_string());
+            return;
+        };
+        match parameter_form::copy_to_clipboard(&display) {
+            Ok(()) => self.status_message = Some("Command copied to clipboard.".to_string()),
+            Err(message) => self.status_message = Some(message),
+        }
+    }
+
     /// Delete the partial output file after cancel/failure, then settle.
     fn delete_partial(&mut self) {
         if let Some(run) = self.run.as_mut() {
@@ -1113,6 +1442,20 @@ impl App {
         }
     }
 
+    /// Drain inline-image payloads staged during render. The main loop
+    /// prints them after each draw (Kitty/iTerm2 filmstrip overlay).
+    pub fn take_image_payloads(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_images)
+    }
+
+    /// Terminal resized: overlay payloads are cursor-addressed, so the
+    /// strip must repaint at the new geometry.
+    pub fn on_resize(&mut self) {
+        if let Some(trim) = self.trim.as_mut() {
+            trim.strip_dirty = true;
+        }
+    }
+
     /// Render the current screen, then any overlay popup. Delegates to
     /// `ui::screens::*`.
     pub fn render(&mut self, frame: &mut Frame) {
@@ -1124,6 +1467,15 @@ impl App {
             return;
         }
         let theme = Theme::from_name(&self.settings.general.theme);
+        // Leaving the trim screen with painted inline images: ratatui never
+        // buffered those rows, so clear them explicitly or they linger.
+        if !matches!(self.screen, Screen::Trim) && self.trim_images_shown {
+            if let Some(area) = self.trim.as_ref().and_then(|t| t.strip_area) {
+                self.pending_images
+                    .push(crate::ui::screens::trim::clear_payload(area));
+            }
+            self.trim_images_shown = false;
+        }
         match self.screen {
             Screen::Startup => render_startup(frame, self.spinner),
             Screen::MissingFfmpeg => missing_ffmpeg::render(frame, self, &theme),
@@ -1139,6 +1491,7 @@ impl App {
             }
             Screen::Help { .. } => help::render(frame, self, &theme),
             Screen::Running => crate::ui::screens::running::render(frame, self, &theme),
+            Screen::Trim => crate::ui::screens::trim::render(frame, self, &theme),
             Screen::Queue { .. } => crate::ui::screens::queue::render(frame, self, &theme),
         }
         if let Some(popup) = self.preset_popup.as_ref() {
@@ -1183,6 +1536,7 @@ impl App {
             Screen::MissingFfmpeg => true,
             Screen::FileBrowser => self.browser.path_mode,
             Screen::ParameterForm => self.form.as_ref().is_some_and(|f| f.editing),
+            Screen::Trim => self.trim.as_ref().is_some_and(|t| t.editing),
             Screen::Startup
             | Screen::OperationPicker
             | Screen::Running

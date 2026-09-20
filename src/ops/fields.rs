@@ -222,10 +222,30 @@ pub struct BuildContext<'a> {
     /// when some probes are still pending or failed). Concat compares these
     /// to pick demuxer-vs-filter; other ops ignore the field.
     pub input_probes: Vec<ProbeResult>,
+    /// Timeline clips in seconds for trim (§10). Sorted, non-overlapping,
+    /// owned by the timeline screen. Only trim reads this; every other
+    /// operation ignores it.
+    pub clips: Vec<ClipRange>,
     /// Session capabilities, if available.
     pub caps: Option<&'a CapabilityReport>,
     /// Current field values by field id.
     pub fields: HashMap<&'static str, FieldValue>,
+}
+
+/// One timeline clip range in seconds: keep `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipRange {
+    /// Keep-from timestamp in seconds.
+    pub start: f64,
+    /// Keep-until timestamp in seconds (exclusive).
+    pub end: f64,
+}
+
+impl ClipRange {
+    /// Length in seconds, never negative.
+    pub fn len(&self) -> f64 {
+        (self.end - self.start).max(0.0)
+    }
 }
 
 impl<'a> BuildContext<'a> {
@@ -390,6 +410,7 @@ mod tests {
             output: None,
             probe: None,
             input_probes: Vec::new(),
+            clips: Vec::new(),
             caps: None,
             fields: HashMap::new(),
         };

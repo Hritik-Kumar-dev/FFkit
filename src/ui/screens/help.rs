@@ -39,6 +39,10 @@ pub const BINDINGS: &[(&str, &str)] = &[
     ("p", "Preset picker (operation picker)"),
     ("s", "Save form as preset (parameter form)"),
     ("x", "Remove pending job (queue screen)"),
+    ("Tab", "Next handle / next pane (trim: handles)"),
+    ("n", "New clip (trim timeline)"),
+    ("d", "Remove focused clip (trim timeline)"),
+    ("f", "Jump to fields (trim timeline)"),
 ];
 
 /// Render the help overlay centered over a dimmed frame.

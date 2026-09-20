@@ -9,3 +9,4 @@ pub mod placeholder;
 pub mod popups;
 pub mod queue;
 pub mod running;
+pub mod trim;

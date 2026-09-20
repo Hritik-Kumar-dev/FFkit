@@ -39,6 +39,7 @@ impl OwnedCtx {
             output: self.output.as_ref(),
             probe: self.probes.first(),
             input_probes: self.probes.clone(),
+            clips: Vec::new(),
             caps: None,
             fields: self.fields.clone(),
         }

@@ -35,6 +35,7 @@ pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme) {
         Screen::OperationPicker
         | Screen::Help { .. }
         | Screen::Startup
+        | Screen::Trim
         | Screen::MissingFfmpeg => ("ffkit", "Unexpected screen.".to_string()),
     };
     let card = Paragraph::new(body).alignment(Alignment::Left).block(

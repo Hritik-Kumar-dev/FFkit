@@ -185,6 +185,7 @@ fn resize_crop_produces_square_live() {
             output: Some(&output),
             probe: None,
             input_probes: Vec::new(),
+            clips: Vec::new(),
             caps: None,
             fields,
         };
