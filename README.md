@@ -121,7 +121,7 @@ is used as a read-only reference for flag semantics only. See `DECISIONS.md`.
 ## Status
 
 M1–M7 complete: skeleton, probe+browse, builder+preview, execution,
-all eleven operations, queue+presets, polish (themes, demo tape, release
+ten operations (thumbnail removed in fix pass 2), queue+presets, polish (themes, demo tape, release
 workflow, crates.io-ready). `DECISIONS.md` logs every deviation from the
 build spec with rationale.
 

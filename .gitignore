@@ -1,2 +1,13 @@
 /target/
 *.log
+# User media dropped into tests/ for manual runs must never be committed.
+# (Real fixtures are .json/.toml and unaffected.)
+tests/*.jpeg
+tests/*.jpg
+tests/*.png
+tests/*.webp
+tests/*.mp4
+tests/*.webm
+tests/*.mkv
+tests/*.mov
+tests/*.avi

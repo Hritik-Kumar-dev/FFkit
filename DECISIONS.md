@@ -216,6 +216,27 @@ Log every deviation here. Format: what the spec says, what we did, why.
     Actual publishing needs `CARGO_REGISTRY_TOKEN` — the release workflow
     runs `cargo publish` on `v*` tags after building all three platforms.
 
+## Fix pass 2
+
+41. **§1 re-run freeze was Enter ignored on the overwrite prompt**, not a
+    missing `-y` (asserted present across 3 live runs) or stdin inheritance
+    (null). Enter now confirms; Enter on partial-delete keeps the file.
+42. **§2 success auto-returns** after 1.8s with a summary; any key but `c`/`l`
+    dismisses early; failures stay until acknowledged.
+43. **§3 output editing**: select-all on entry, empty falls back to the
+    default pattern, extensionless names gain the format extension via
+    `builder::resolve_output` in all 11→10 operations.
+44. **§4 compress wall was odd dimensions** (libx264 refuses them):
+    `even_dims_filter` auto-appends the shave filter when the probe shows
+    odd dims, explained in the preview.
+45. **§5 extract-audio hole was video-only inputs** getting a fake default
+    track → doomed `-map 0:a:0`. Build refuses loudly; form shows a
+    disabled option.
+46. **§6 resize verified working** on preset/custom/crop paths live; the
+    error table fires (`Odd video dimensions`) on forced odd stretches.
+47. **§7 thumbnail removed** (registry now ten). Also: user media dropped
+    in `tests/` is gitignored from here on — fixtures stay `.json`.
+
 ## Perf diagnostic ("slower than ffmpeg directly")
 
 37. **No overhead found in the encode path; fixed the one real hotspot.**
